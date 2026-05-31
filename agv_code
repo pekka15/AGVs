@@ -1,0 +1,1398 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <LiquidCrystal_I2C.h>
+#include "AA_MCP2515.h"
+
+// =====================================================
+// LCD
+// =====================================================
+#define LCD_SDA_PIN   21
+#define LCD_SCL_PIN   22
+#define LCD_ADDRESS   0x27
+
+// =====================================================
+// ULTRASONIC SCALING
+// =====================================================
+float ultrasonicScale = 1.0f;
+int ultrasonicDistance = 999;
+
+bool stationDetectionActive = false;
+
+bool ultrasonicStop = false;
+
+// Optional filtering
+float ultrasonicFiltered = 999;
+const float ULTRA_ALPHA = 0.3f;
+
+bool readFrame(uint8_t *buf, int len);
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+// =====================================================
+// CHARGING DETECTION (IMPROVED)
+// =====================================================
+#define CT_PIN 34
+
+bool isCharging = false;
+
+// Filtering
+float chargeFiltered = 0;
+const float CHARGE_ALPHA = 0.1f;   // MUCH slower → stable
+
+// Voltage thresholds (TUNE THESE)
+const float CHARGE_ON_THRESHOLD  = 0.045f;
+const float CHARGE_OFF_THRESHOLD = 0.020f;
+
+// Time debounce (CRITICAL)
+unsigned long chargeStateChangeTime = 0;
+const unsigned long CHARGE_CONFIRM_MS = 1000; // must be stable for 2 sec
+
+bool chargingCandidate = false;
+bool notChargingCandidate = false;
+// =====================================================
+// MCP2515 CAN
+// =====================================================
+const uint8_t CAN_CS  = 5;
+const int8_t  CAN_INT = 4;
+
+#define CAN_SCK_PIN   18
+#define CAN_MISO_PIN  19
+#define CAN_MOSI_PIN  23
+
+const CANBitrate::Config CAN_BITRATE = CANBitrate::Config_10MHz_125kbps;
+CANConfig config(CAN_BITRATE, CAN_CS, CAN_INT, SPI, 8000000);
+CANController CAN(config);
+
+const uint8_t  NODE_ID  = 0x0A;
+const uint16_t TPDO1_ID = 0x180 + NODE_ID;
+
+// =====================================================
+// ESP-NOW
+// =====================================================
+uint8_t masterMAC[] = {0x3C, 0x71, 0xBF, 0x7E, 0xAF, 0x04};
+
+typedef struct {
+  char text[32];
+} message;
+
+message msg;
+
+char lastCommand[32] = "";
+bool newCommandReceived = false;
+bool espNowReady = false;
+
+// =====================================================
+// RFID + BUTTON
+// =====================================================
+#define BUTTON_PIN   27
+
+bool ultrasonicEnabled = false;   // OFF by default (important)
+#define BUMPER_PIN 14
+
+#define RS485_RXD 17
+#define RS485_TXD 16
+#define RS485_DE  15
+
+HardwareSerial RS485(2);
+
+uint8_t ultraCmd[] = {0x55, 0xAA, 0x11, 0x00, 0x02, 0x12};
+
+unsigned long lastUltraTime = 0;
+const unsigned long ULTRA_INTERVAL = 300;
+
+String rfidBuffer = "";
+
+bool lastRawButtonState = HIGH;
+bool stableButtonState  = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+// =====================================================
+// AUTO / WAIT STATE
+// =====================================================
+bool autoMovementFlag   = true;
+bool waitingForContinue = false;
+bool requestSent        = false;
+bool stoppedAtStation   = false;
+
+String currentStationMessage = "";
+String currentRequestMessage = "";
+
+String lastTagRead = "";
+unsigned long lastTagTime = 0;
+const unsigned long TAG_IGNORE_MS = 2500;
+
+// =====================================================
+// WAITING / REQUEST RETRY STATE
+// =====================================================
+bool waitingForPermission = false;
+String waitingArrivalMessage = "";
+String waitingRequestMessage = "";
+
+unsigned long lastPermissionRequestTime = 0;
+const unsigned long REQUEST_REPEAT_MS = 1000;
+
+// =====================================================
+// PWM
+// =====================================================
+#define PWM_POS_PIN     25
+#define PWM_NEG_PIN     26
+
+#define PWM_FREQ        2000
+#define PWM_RES_BITS    10
+#define PWM_MAX         1023
+
+// =====================================================
+// REMOTE SPEED CONTROL
+// =====================================================
+int commandedSpeedStep = 15;
+float commandedSpeedScale = 1.0;
+
+const float MIN_SPEED_SCALE = 0.20f;
+const float MAX_SPEED_SCALE = 1.00f;
+
+// =====================================================
+// MODE SWITCHES
+// =====================================================
+#define MODE_AUTO_PIN   32
+#define MODE_MANUAL_PIN 33
+
+enum Mode {
+  MODE_STOP,
+  MODE_AUTO,
+  MODE_MANUAL
+};
+
+// =====================================================
+// VARIABLES
+// =====================================================
+uint8_t magLevel = 0;
+int16_t LD1 = 0;
+int16_t LD2 = 0;
+int16_t LD3 = 0;
+
+float LD2_filtered = 0.0f;
+const float LD2_ALPHA = 0.25f;
+
+uint16_t dutyNeg = 0;
+uint16_t dutyPos = 0;
+bool agvMoving = false;
+
+unsigned long lastCanRxTime = 0;
+const unsigned long CAN_TIMEOUT_MS = 100;
+
+unsigned long lastSerialPrint = 0;
+const unsigned long SERIAL_PRINT_MS = 200;
+
+unsigned long lastHeartbeatTime = 0;
+const unsigned long HEARTBEAT_MS = 1000;
+
+// =====================================================
+// MODE DEBOUNCE / FILTER
+// =====================================================
+Mode stableMode = MODE_STOP;
+Mode lastRawMode = MODE_STOP;
+Mode modeChangeFrom = MODE_STOP;
+Mode modeChangeTo   = MODE_STOP;
+bool modeChangedFlag = false;
+
+unsigned long modeDebounceStart = 0;
+const unsigned long MODE_DEBOUNCE_MS = 120;
+
+// =====================================================
+// FUNCTION DECLARATIONS
+// =====================================================
+Mode readModeSwitchRaw();
+Mode readModeSwitch();
+
+void handleModeTransition(Mode oldMode, Mode newMode);
+const char* modeToText(Mode m);
+const char* modeToShortText(Mode m);
+
+void stopMotors();
+void runManualFullSpeed();
+void MaglinTracking(int16_t LD21, uint16_t &dutyNeg1, uint16_t &dutyPos1);
+void updateLCDMode(const char* modeText);
+void updateLCDValues();
+void printDebug(Mode currentMode);
+static inline int16_t le_i16(uint8_t lo, uint8_t hi);
+
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status);
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
+void triggerManualStationRequest();
+bool buttonPressedEvent();
+bool readRFID(String &tagOut);
+String cleanTag(String raw);
+String mapTagToArrivalMessage(const String &tag);
+String mapArrivalToRequest(const String &arrivalMessage);
+
+void sendToMaster(const char* text);
+void sendDebugToMaster(const char* text);
+void sendHeartbeat(Mode currentMode);
+
+void resetAutoStationState();
+
+void handleMasterCommand(const char* cmd);
+bool parseContinueSpeedStep(const char* cmd, int &stepOut);
+void updateSpeedScaleFromStep(int step);
+uint16_t applySpeedScale(uint16_t dutyIn);
+
+void startWaitingAtLocation(const String &arrivalMessage);
+void handleWaitingRequests();
+
+void handleFinalMarker(uint8_t finalMarker)
+{
+  static uint8_t markers[3] = {0, 0, 0};
+  static uint8_t index = 0;
+  static unsigned long lastMarkerTime = 0;
+
+  const unsigned long TIMEOUT = 10000;
+
+  if (finalMarker < 1 || finalMarker > 3) return;
+
+  // timeout reset
+  if (millis() - lastMarkerTime > TIMEOUT)
+  {
+    index = 0;
+  }
+
+  lastMarkerTime = millis();
+
+  // store marker
+  // =====================================================
+  // FIRST MARKER DETECTED
+  // DISABLE BUMPER + ULTRASONIC IMMEDIATELY
+  // =====================================================
+  if (index == 0)
+  {
+    stationDetectionActive = true;
+
+    ultrasonicEnabled = false;
+    ultrasonicStop = false;
+
+    Serial.println("FIRST MARKER -> SAFETY DISABLED");
+  }
+
+  // store marker
+  markers[index] = finalMarker;
+  index++;
+
+  Serial.print("Marker: ");
+  Serial.println(finalMarker);
+
+  // if we have 3 markers → decode
+  if (index == 3)
+  {
+    uint8_t first  = markers[0];
+    uint8_t second = markers[1];
+    uint8_t third  = markers[2];
+
+    uint8_t station =
+      (first - 1) * 9 +
+      (second - 1) * 3 +
+      third;
+
+    String msg = "AT_STATION_" + String(station);
+
+    // =====================================================
+    // DISABLE SAFETY INPUTS DURING STATION APPROACH
+    // =====================================================
+    Serial.println("STATION DETECTED -> ULTRASONIC + BUMPER DISABLED");
+
+    startWaitingAtLocation(msg);
+
+    // reset for next
+    index = 0;
+  }
+}
+
+void checkChargingAndSend()
+{
+  int raw = analogRead(CT_PIN);
+
+  // Convert to voltage (ESP32 ADC ~3.3V range)
+  float voltage = (raw / 4095.0f) * 3.3f;
+
+  // Filter it
+  chargeFiltered =
+    CHARGE_ALPHA * voltage +
+    (1.0f - CHARGE_ALPHA) * chargeFiltered;
+
+  Serial.print("Charge V: ");
+  Serial.println(chargeFiltered, 3);
+
+  // Hysteresis + debounce
+  if (!isCharging && chargeFiltered > CHARGE_ON_THRESHOLD)
+  {
+    if (!chargingCandidate)
+    {
+      chargingCandidate = true;
+      chargeStateChangeTime = millis();
+    }
+
+    if (millis() - chargeStateChangeTime > CHARGE_CONFIRM_MS)
+    {
+      isCharging = true;
+      chargingCandidate = false;
+      Serial.println("CHARGING DETECTED");
+      sendToMaster("CHARGING");
+    }
+  }
+  else if (isCharging && chargeFiltered < CHARGE_OFF_THRESHOLD)
+  {
+    if (!notChargingCandidate)
+    {
+      notChargingCandidate = true;
+      chargeStateChangeTime = millis();
+    }
+
+    if (millis() - chargeStateChangeTime > CHARGE_CONFIRM_MS)
+    {
+      isCharging = false;
+      notChargingCandidate = false;
+      Serial.println("NOT CHARGING");
+      sendToMaster("NOT_CHARGING");
+    }
+  }
+  else
+  {
+    chargingCandidate = false;
+    notChargingCandidate = false;
+  }
+}
+
+void updateUltrasonicScaling(int distance)
+{
+  ultrasonicDistance = distance;
+
+  // Simple, direct logic
+  if (distance <= 200) {
+    ultrasonicStop = true;
+  } else if (distance >= 230) {
+    ultrasonicStop = false;
+  }
+
+  Serial.print("DIST=");
+  Serial.print(distance);
+  Serial.print(" STOP=");
+  Serial.println(ultrasonicStop);
+}
+
+void handleWaitingRequests()
+{
+  if (!waitingForPermission) return;
+  if (waitingRequestMessage.length() == 0) return;
+
+  if (millis() - lastPermissionRequestTime >= REQUEST_REPEAT_MS)
+  {
+    lastPermissionRequestTime = millis();
+
+    Serial.print("Retry request -> ");
+    Serial.println(waitingRequestMessage);
+
+    sendToMaster(waitingRequestMessage.c_str());
+  }
+}
+// =====================================================
+// HELPERS
+// =====================================================
+static inline int16_t le_i16(uint8_t lo, uint8_t hi) {
+  return (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+}
+
+const char* modeToText(Mode m) {
+  if (m == MODE_AUTO)   return "AUTO";
+  if (m == MODE_MANUAL) return "MANUAL";
+  return "STOP";
+}
+
+const char* modeToShortText(Mode m) {
+  if (m == MODE_AUTO)   return "A";
+  if (m == MODE_MANUAL) return "M";
+  return "S";
+}
+
+// =====================================================
+// ESP-NOW CALLBACKS
+// =====================================================
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.print("Last packet send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+}
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  message incoming;
+  memset(&incoming, 0, sizeof(incoming));
+  memcpy(&incoming, data, min(len, (int)sizeof(incoming)));
+
+  strncpy(lastCommand, incoming.text, sizeof(lastCommand) - 1);
+  lastCommand[sizeof(lastCommand) - 1] = '\0';
+  newCommandReceived = true;
+
+  Serial.print("ESP-NOW RX -> ");
+  Serial.println(lastCommand);
+}
+
+
+
+// =====================================================
+// ESP-NOW SEND HELPERS
+// =====================================================
+void sendToMaster(const char* text) {
+  if (!espNowReady) return;
+
+  memset(&msg, 0, sizeof(msg));
+  strncpy(msg.text, text, sizeof(msg.text) - 1);
+
+  esp_err_t result = esp_now_send(masterMAC, (uint8_t*)&msg, sizeof(msg));
+
+  Serial.print("ESP-NOW TX -> ");
+  Serial.print(msg.text);
+  Serial.print(" | ");
+  Serial.println(result == ESP_OK ? "ESP_OK" : "ERROR");
+}
+
+void sendDebugToMaster(const char* text) {
+  // Debug sending disabled
+}
+
+void sendHeartbeat(Mode currentMode) {
+  // Heartbeat disabled
+}
+
+// =====================================================
+// MASTER COMMAND HANDLING
+// =====================================================
+bool parseContinueSpeedStep(const char* cmd, int &stepOut) {
+  if (strncmp(cmd, "CONTINUE_", 9) != 0) {
+    return false;
+  }
+
+  int step = atoi(cmd + 9);
+
+  if (step < 1 || step > 15) {
+    return false;
+  }
+
+  stepOut = step;
+  return true;
+}
+
+void updateSpeedScaleFromStep(int step) {
+  if (step < 1) step = 1;
+  if (step > 15) step = 15;
+
+  commandedSpeedStep = step;
+
+  commandedSpeedScale =
+    MIN_SPEED_SCALE +
+    ((float)(step - 1) / 14.0f) * (MAX_SPEED_SCALE - MIN_SPEED_SCALE);
+
+  Serial.print("Speed step set to ");
+  Serial.print(commandedSpeedStep);
+  Serial.print(" -> scale = ");
+  Serial.println(commandedSpeedScale, 3);
+}
+
+uint16_t applySpeedScale(uint16_t dutyIn) {
+
+  float scaled = (float)dutyIn;
+
+  // Master speed scaling (existing system)
+  scaled *= commandedSpeedScale;
+
+  // Ultrasonic scaling (NEW)
+  scaled *= ultrasonicScale;
+
+  if (scaled < 0.0f) scaled = 0.0f;
+  if (scaled > PWM_MAX) scaled = PWM_MAX;
+
+  return (uint16_t)scaled;
+}
+
+void handleMasterCommand(const char* cmd) {
+  int parsedStep = 0;
+
+  if (parseContinueSpeedStep(cmd, parsedStep)) {
+    updateSpeedScaleFromStep(parsedStep);
+
+    autoMovementFlag = true;
+    waitingForContinue = false;
+    requestSent = false;
+    stoppedAtStation = false;
+
+    waitingForPermission = false;
+    waitingArrivalMessage = "";
+    waitingRequestMessage = "";
+
+    Serial.print("Master allowed movement with speed step ");
+    Serial.println(parsedStep);
+
+    char dbg[24];
+    snprintf(dbg, sizeof(dbg), "CMD_CONT_%d", parsedStep);
+    sendDebugToMaster(dbg);
+    return;
+  }
+
+  if (strcmp(cmd, "REPORT_LOCATION") == 0)
+  {
+      // IF MOVING -> IGNORE
+      if (!stoppedAtStation)
+      {
+          Serial.println("NOT AT STATION -> IGNORING REPORT_LOCATION");
+          return;
+      }
+
+      // STATIONARY -> REPORT
+      if (currentStationMessage.length() > 0)
+      {
+          sendToMaster(currentStationMessage.c_str());
+
+          Serial.print("Reported location: ");
+          Serial.println(currentStationMessage);
+      }
+
+      return;
+  }
+
+  if (strcmp(cmd, "CONTINUE") == 0) {
+    autoMovementFlag = true;
+    waitingForContinue = false;
+    requestSent = false;
+    stoppedAtStation = false;
+
+    waitingForPermission = false;
+    waitingArrivalMessage = "";
+    waitingRequestMessage = "";
+
+    Serial.println("Master allowed AUTO movement again");
+    sendDebugToMaster("CMD_CONT");
+    return;
+  }
+
+  if (strcmp(cmd, "WAIT") == 0 ||
+      strcmp(cmd, "STOP") == 0 ||
+      strcmp(cmd, "STOP_OP2") == 0 ||
+      strcmp(cmd, "STOP_OP3") == 0) {
+    autoMovementFlag = false;
+    waitingForContinue = true;
+    requestSent = false;
+    stoppedAtStation = true;
+
+    Serial.print("Master sent stop/wait command: ");
+    Serial.println(cmd);
+
+    sendDebugToMaster("CMD_STOPWAIT");
+    return;
+  }
+
+  if (strcmp(cmd, "MOVE") == 0 ||
+      strcmp(cmd, "MOVE_OP2") == 0 ||
+      strcmp(cmd, "MOVE_OP3") == 0) {
+    autoMovementFlag = true;
+    waitingForContinue = false;
+    requestSent = false;
+    stoppedAtStation = false;
+
+    waitingForPermission = false;
+    waitingArrivalMessage = "";
+    waitingRequestMessage = "";
+
+    Serial.print("Master sent move command: ");
+    Serial.println(cmd);
+
+    sendDebugToMaster("CMD_MOVE");
+    return;
+  }
+
+  Serial.print("Unknown master command: ");
+  Serial.println(cmd);
+
+  sendDebugToMaster("CMD_UNKNOWN");
+}
+
+// =====================================================
+// BUTTON / RFID HELPERS
+// =====================================================
+bool buttonPressedEvent() {
+  bool rawReading = digitalRead(BUTTON_PIN);
+
+  if (rawReading != lastRawButtonState) {
+    lastDebounceTime = millis();
+    lastRawButtonState = rawReading;
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (rawReading != stableButtonState) {
+      stableButtonState = rawReading;
+
+      if (stableButtonState == LOW) {
+        return true;
+      }
+
+      if (stableButtonState == HIGH) {
+        Serial.println("Button released");
+      }
+    }
+  }
+
+  return false;
+}
+
+String cleanTag(String raw) {
+  String cleaned = "";
+
+  for (int i = 0; i < raw.length(); i++) {
+    char c = raw[i];
+    if ((c >= '0' && c <= '9') ||
+        (c >= 'A' && c <= 'F') ||
+        (c >= 'a' && c <= 'f')) {
+      cleaned += c;
+    }
+  }
+
+  cleaned.toUpperCase();
+  return cleaned;
+}
+
+bool readRFID(String &tagOut) {
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+
+    if (c == '\n' || c == '\r') {
+      if (rfidBuffer.length() > 0) {
+        tagOut = cleanTag(rfidBuffer);
+        rfidBuffer = "";
+        return tagOut.length() > 0;
+      }
+    } else {
+      rfidBuffer += c;
+
+      if (rfidBuffer.length() > 64) {
+        rfidBuffer = "";
+      }
+    }
+  }
+
+  return false;
+}
+
+// =====================================================
+// RFID TAG -> MASTER MESSAGE MAPPING
+// =====================================================
+String mapTagToArrivalMessage(const String &tag) {
+  if (tag == "0D008B6C5BB1") return "AT_STATION_1";
+
+  // PREBUFFER TAGS - REPLACE WITH REAL TAGS
+  if (tag == "TAG_PREBUFFER_5") return "AT_PREBUFFER_5";
+  if (tag == "TAG_PREBUFFER_4") return "AT_PREBUFFER_4";
+  if (tag == "TAG_PREBUFFER_3") return "AT_PREBUFFER_3";
+  if (tag == "TAG_PREBUFFER_2") return "AT_PREBUFFER_2";
+  if (tag == "TAG_PREBUFFER_1") return "AT_PREBUFFER_1";
+
+  // OTHER TAGS - REPLACE WITH REAL TAGS
+  if (tag == "TAG_STATION_7")   return "AT_STATION_7";
+  if (tag == "TAG_BUFFER")      return "AT_BUFFER";
+  if (tag == "TAG_STATION_2")   return "AT_STATION_2";
+  if (tag == "TAG_STATION_3")   return "AT_STATION_3";
+  if (tag == "TAG_STATION_4")   return "AT_STATION_4";
+  if (tag == "TAG_STATION_5")   return "AT_STATION_5";
+  if (tag == "TAG_STATION_6")   return "AT_STATION_6";
+
+  return "";
+}
+
+String mapArrivalToRequest(const String &arrivalMessage) {
+  if (arrivalMessage == "AT_STATION_1")    return "REQUEST_STATION_1";
+  if (arrivalMessage == "AT_STATION_2")    return "REQUEST_STATION_2";
+  if (arrivalMessage == "AT_STATION_3")    return "REQUEST_STATION_3";
+  if (arrivalMessage == "AT_STATION_4")    return "REQUEST_STATION_4";
+  if (arrivalMessage == "AT_STATION_5")    return "REQUEST_STATION_5";
+  if (arrivalMessage == "AT_STATION_6")    return "REQUEST_STATION_6";
+  if (arrivalMessage == "AT_STATION_7")    return "REQUEST_STATION_7";
+  if (arrivalMessage == "AT_STATION_8")  return "REQUEST_STATION_8";
+  if (arrivalMessage == "AT_STATION_9")  return "REQUEST_STATION_9";
+  if (arrivalMessage == "AT_STATION_10") return "REQUEST_STATION_10";
+  if (arrivalMessage == "AT_STATION_11") return "REQUEST_STATION_11";
+  if (arrivalMessage == "AT_STATION_12") return "REQUEST_STATION_12";
+  if (arrivalMessage == "AT_STATION_13")   return "REQUEST_BUFFER";
+
+  if (arrivalMessage == "AT_PREBUFFER_5")  return "REQUEST_PREBUFFER_5";
+  if (arrivalMessage == "AT_PREBUFFER_4")  return "REQUEST_PREBUFFER_4";
+  if (arrivalMessage == "AT_PREBUFFER_3")  return "REQUEST_PREBUFFER_3";
+  if (arrivalMessage == "AT_PREBUFFER_2")  return "REQUEST_PREBUFFER_2";
+  if (arrivalMessage == "AT_PREBUFFER_1")  return "REQUEST_PREBUFFER_1";
+
+  return "";
+}
+
+void startWaitingAtLocation(const String &arrivalMessage)
+{ 
+  stationDetectionActive = false;
+  // ================= ULTRASONIC CONTROL =================
+  if (arrivalMessage == "AT_STATION_1" ||
+      arrivalMessage == "AT_STATION_2" ||
+      arrivalMessage == "AT_STATION_3" ||
+      arrivalMessage == "AT_STATION_4" ||
+      arrivalMessage == "AT_STATION_5")
+  {
+    ultrasonicEnabled = true;
+    Serial.println("ULTRA ON");
+  }
+  else
+  {
+    ultrasonicEnabled = false;
+    Serial.println("ULTRA OFF");
+  }
+  waitingArrivalMessage = arrivalMessage;
+  waitingRequestMessage = mapArrivalToRequest(arrivalMessage);
+
+  // Always stop and mark waiting
+  autoMovementFlag = false;
+  waitingForContinue = true;
+  requestSent = false;
+  stoppedAtStation = true;
+
+  currentStationMessage = waitingArrivalMessage;
+  currentRequestMessage = waitingRequestMessage;
+
+  stopMotors();
+
+  Serial.print("WAITING AT: ");
+  Serial.println(waitingArrivalMessage);
+
+  Serial.print("REQUEST MSG: ");
+  Serial.println(waitingRequestMessage);
+
+  // Always announce arrival first
+  sendToMaster(waitingArrivalMessage.c_str());
+
+  // -------------------------------------------------
+  // ONLY prebuffers should auto-request immediately
+  // -------------------------------------------------
+// -------------------------------------------------
+// PREBUFFER STATIONS AUTO-REQUEST
+// -------------------------------------------------
+  if (arrivalMessage == "AT_STATION_8"  ||
+      arrivalMessage == "AT_STATION_9"  ||
+      arrivalMessage == "AT_STATION_10" ||
+      arrivalMessage == "AT_STATION_11" ||
+      arrivalMessage == "AT_STATION_12")
+  {
+      waitingForPermission = true;
+      lastPermissionRequestTime = 0;
+
+      Serial.println("Prebuffer station -> automatic request enabled");
+  }
+  else
+  {
+      waitingForPermission = false;
+      lastPermissionRequestTime = 0;
+
+      Serial.println("Normal station -> waiting for button/manual request");
+  }
+}
+
+void triggerManualStationRequest()
+{
+  if (!stoppedAtStation) return;
+  if (waitingArrivalMessage.length() == 0) return;
+  if (waitingRequestMessage.length() == 0) return;
+
+  // Do not use button/manual request for prebuffers
+  if (waitingArrivalMessage.startsWith("AT_PREBUFFER_")) return;
+
+  waitingForPermission = true;
+  lastPermissionRequestTime = 0;
+
+  Serial.print("Manual request triggered -> ");
+  Serial.println(waitingRequestMessage);
+
+  sendToMaster(waitingRequestMessage.c_str());
+}
+
+// =====================================================
+// AUTO STATE RESET
+// =====================================================
+void resetAutoStationState()
+{
+  autoMovementFlag = true;
+  waitingForContinue = false;
+  requestSent = false;
+  stoppedAtStation = false;
+
+  waitingForPermission = false;
+
+  // KEEP LOCATION MEMORY
+  waitingArrivalMessage = "";
+  waitingRequestMessage = "";
+
+  // RESET SPEED BACK TO NORMAL
+  updateSpeedScaleFromStep(5);
+
+  Serial.println("AUTO STATE RESET");
+}
+
+// =====================================================
+// MODE FILTERING
+// =====================================================
+Mode readModeSwitchRaw() {
+  int autoState   = digitalRead(MODE_AUTO_PIN);
+  int manualState = digitalRead(MODE_MANUAL_PIN);
+
+  if (autoState == LOW) {
+    return MODE_AUTO;
+  }
+  if (manualState == LOW) {
+    return MODE_MANUAL;
+  }
+  return MODE_STOP;
+}
+
+Mode readModeSwitch() {
+  Mode rawMode = readModeSwitchRaw();
+
+  if (rawMode != lastRawMode) {
+    lastRawMode = rawMode;
+    modeDebounceStart = millis();
+  }
+
+  if ((millis() - modeDebounceStart) >= MODE_DEBOUNCE_MS) {
+    if (stableMode != rawMode) {
+      modeChangeFrom = stableMode;
+      modeChangeTo   = rawMode;
+      stableMode = rawMode;
+      modeChangedFlag = true;
+    }
+  }
+
+  return stableMode;
+}
+
+void handleModeTransition(Mode oldMode, Mode newMode) {
+  Serial.print("Stable mode change: ");
+  Serial.print(modeToText(oldMode));
+  Serial.print(" -> ");
+  Serial.println(modeToText(newMode));
+
+  char dbg[24];
+  snprintf(dbg, sizeof(dbg), "MODE_%s", modeToShortText(newMode));
+  sendDebugToMaster(dbg);
+
+  if (oldMode == MODE_AUTO && newMode != MODE_AUTO) {
+    Serial.println("Leaving AUTO -> resetting AUTO station state");
+    stopMotors();
+    resetAutoStationState();
+    sendDebugToMaster("LEAVE_AUTO_RST");
+  }
+}
+
+bool readUltraFrame(uint8_t *buf) {
+  static uint8_t idx = 0;
+
+  while (RS485.available()) {
+    uint8_t b = RS485.read();
+
+    if (idx == 0 && b != 0x55) continue;
+    if (idx == 1 && b != 0xAA) { idx = 0; continue; }
+
+    buf[idx++] = b;
+
+    if (idx == 8) {
+      idx = 0;
+      return true;
+    }
+  }
+  return false;
+}
+
+void updateUltrasonicRS485()
+{
+  static unsigned long lastRun = 0;
+  static unsigned long sendTime = 0;
+  static bool waiting = false;
+  static uint8_t buf[8];
+
+  // Run every 100 ms
+  if (millis() - lastRun < 100) return;
+  lastRun = millis();
+
+  // ================= STEP 1: SEND =================
+  if (!waiting)
+  {
+    // clear buffer
+    while (RS485.available()) RS485.read();
+
+    digitalWrite(RS485_DE, HIGH);
+    delayMicroseconds(200);
+
+    RS485.write(ultraCmd, sizeof(ultraCmd));
+    RS485.flush();
+
+    delayMicroseconds(200);
+    digitalWrite(RS485_DE, LOW);
+
+    sendTime = millis();
+    waiting = true;
+
+    return;
+  }
+
+  // ================= STEP 2: READ =================
+  if (waiting && (millis() - sendTime > 80))   // give sensor time
+  {
+    waiting = false;
+
+    if (readUltraFrame(buf))
+    {
+      uint8_t checksum = 0;
+      for (int i = 0; i < 7; i++) checksum += buf[i];
+
+      if (buf[0] == 0x55 && buf[1] == 0xAA && checksum == buf[7])
+      {
+        int distance = (buf[5] << 8) | buf[6];
+
+        Serial.print("ULTRA DIST: ");
+        Serial.println(distance);
+
+        updateUltrasonicScaling(distance);
+      }
+    }
+  }
+}
+
+
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  
+  Serial.println();
+  Serial.println("ESP32 AGV MAG SENSOR START");
+
+  // ================= INPUTS =================
+  pinMode(MODE_AUTO_PIN, INPUT);
+  pinMode(MODE_MANUAL_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUMPER_PIN, INPUT_PULLUP);
+  // ================= RFID =================
+  
+
+  // ================= RS485 ULTRASONIC =================
+  pinMode(RS485_DE, OUTPUT);
+  digitalWrite(RS485_DE, LOW);
+
+  RS485.begin(19200, SERIAL_8N1, RS485_RXD, RS485_TXD);
+
+  Serial.println("RS485 Ultrasonic Ready");
+
+  // ================= WIFI + ESP-NOW =================
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(200);
+  esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE);
+
+  Serial.print("Slave MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+  } else {
+    esp_now_register_send_cb(onDataSent);
+    esp_now_register_recv_cb(onDataRecv);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, masterMAC, 6);
+    peerInfo.channel = 13;
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("Failed to add master peer");
+    } else {
+      Serial.println("ESP-NOW ready");
+      espNowReady = true;
+    }
+  }
+
+  // ================= LCD =================
+  Wire.begin(21,22);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("AGV Control Panel");
+  lcd.setCursor(0, 1); lcd.print("Mode:");
+  lcd.setCursor(0, 2); lcd.print("LD2:");
+  lcd.setCursor(0, 3); lcd.print("Mag:");
+
+  // ================= PWM =================
+  if (!ledcAttach(PWM_POS_PIN, PWM_FREQ, PWM_RES_BITS)) {
+    Serial.println("PWM attach failed on PWM_POS_PIN");
+  }
+  if (!ledcAttach(PWM_NEG_PIN, PWM_FREQ, PWM_RES_BITS)) {
+    Serial.println("PWM attach failed on PWM_NEG_PIN");
+  }
+
+  ledcWrite(PWM_POS_PIN, 0);
+  ledcWrite(PWM_NEG_PIN, 0);
+
+  // ================= CAN =================
+  SPI.begin(CAN_SCK_PIN, CAN_MISO_PIN, CAN_MOSI_PIN, CAN_CS);
+
+  if (CAN.begin(CANController::Mode::Normal) != CANController::OK) {
+    Serial.println("CAN begin failed");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("CAN begin failed");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("CAN started");
+  Serial.println("LD1 LD2 LD3 MagLevel");
+
+  // ================= STATE INIT =================
+  stableMode = readModeSwitchRaw();
+  lastRawMode = stableMode;
+  modeDebounceStart = millis();
+
+  autoMovementFlag = true;
+  waitingForContinue = false;
+  requestSent = false;
+  stoppedAtStation = false;
+
+  sendDebugToMaster("BOOT");
+
+  Serial.println("SYSTEM READY");
+}
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+
+  // =====================================================
+  // SERIAL TEST INPUT
+  // =====================================================
+  if (Serial.available()) {
+    String testCmd = Serial.readStringUntil('\n');
+    testCmd.trim();
+
+    if (testCmd.length() > 0) {
+
+      Serial.print("SIM INPUT: ");
+      Serial.println(testCmd);
+
+      // 🔥 Simulate station arrival
+      if (testCmd.startsWith("AT_")) {
+        startWaitingAtLocation(testCmd);
+      }
+      else {
+        strncpy(lastCommand, testCmd.c_str(), sizeof(lastCommand) - 1);
+        lastCommand[sizeof(lastCommand) - 1] = '\0';
+        newCommandReceived = true;
+      }
+    }
+  }
+
+  // =====================================================
+  // CAN READ
+  // =====================================================
+  CANFrame frame;
+  if (CAN.read(frame) == CANController::IOResult::OK) {
+    if (frame.getId() == TPDO1_ID && frame.getDlc() == 8) {
+      const uint8_t* d = frame.getData();
+
+      LD1 = le_i16(d[0], d[1]);
+      LD2 = le_i16(d[2], d[3]);
+      LD3 = le_i16(d[4], d[5]);
+
+      magLevel = (d[7] >> 1) & 0x07;
+      lastCanRxTime = millis();
+
+      LD2_filtered = LD2_ALPHA * LD2 + (1.0f - LD2_ALPHA) * LD2_filtered;
+      updateLCDValues();
+      // ================= MARKER EXTRACTION =================
+      uint8_t rawMarker = d[6];
+      uint8_t sensorCode = rawMarker >> 4;
+
+      // ================= MAP TO 1–3 =================
+      uint8_t marker = 0;
+
+      if (sensorCode == 1) marker = 1;   // 30mm
+      else if (sensorCode == 2) marker = 2;  // 60mm
+      else if (sensorCode == 3) marker = 3;  // 90mm
+      else marker = 0;   // ignore everything else
+
+      // Simple edge detection (only trigger when marker changes)
+      static uint8_t lastMarker = 0;
+
+      if (marker != 0 && marker != lastMarker)
+      {
+        Serial.print("DETECTED MARKER: ");
+        Serial.println(marker);
+
+        handleFinalMarker(marker);
+      }
+
+      lastMarker = marker;
+    }
+  }
+
+  // =====================================================
+  // CHARGING
+  // =====================================================
+  static unsigned long lastCharge = 0;
+  if (millis() - lastCharge > 200) {
+    lastCharge = millis();
+    checkChargingAndSend();
+  }
+
+  // =====================================================
+  // MASTER COMMAND
+  // =====================================================
+  if (newCommandReceived) {
+    newCommandReceived = false;
+    handleMasterCommand(lastCommand);
+  }
+
+  // =====================================================
+  // MODE
+  // =====================================================
+  Mode currentMode = readModeSwitch();
+
+  if (modeChangedFlag) {
+    modeChangedFlag = false;
+    handleModeTransition(modeChangeFrom, modeChangeTo);
+  }
+
+  // =====================================================
+  // AUTO MODE (FIXED)
+  // =====================================================
+  if (currentMode == MODE_AUTO) {
+    bool bumperActive = false;
+
+    // =====================================================
+    // ONLY ALLOW BUMPER WHEN NOT APPROACHING STATION
+    // =====================================================
+    if (!stationDetectionActive)
+    {
+      bumperActive = (digitalRead(BUMPER_PIN) == LOW);
+    }
+
+    if (bumperActive)
+    {
+      stopMotors();
+      Serial.println("BUMPER HIT!");
+      return;
+    }
+    if (ultrasonicEnabled && ultrasonicStop) {
+      stopMotors();
+    }
+    updateLCDMode(waitingForContinue ? "WAIT" : "AUTO");
+
+    // 🔥 Ultrasonic update
+    if (ultrasonicEnabled) {
+      updateUltrasonicRS485();
+    } 
+    else {
+    ultrasonicStop = false;   // prevents ghost stops
+}
+
+    // 🔥 HARD STOP PRIORITY (ONLY ONE PLACE)
+    if (ultrasonicEnabled && ultrasonicStop) {
+      stopMotors();
+    }
+
+    else if (stoppedAtStation) {
+      stopMotors();
+
+      if (buttonPressedEvent()) {
+        triggerManualStationRequest();
+      }
+
+      handleWaitingRequests();
+    }
+
+    else if (!autoMovementFlag) {
+      stopMotors();
+    }
+
+    else if ((millis() - lastCanRxTime) > CAN_TIMEOUT_MS) {
+      stopMotors();
+    }
+
+    else if (magLevel >= 1) {
+      MaglinTracking((int16_t)LD2_filtered, dutyNeg, dutyPos);
+    }
+
+    else {
+      stopMotors();
+    }
+  }
+
+  // =====================================================
+  // MANUAL
+  // =====================================================
+  else if (currentMode == MODE_MANUAL) {
+    updateLCDMode("MANUAL");
+    runManualFullSpeed();
+  }
+
+  // =====================================================
+  // STOP
+  // =====================================================
+  else {
+    updateLCDMode("STOP");
+    stopMotors();
+  }
+
+  // =====================================================
+  // DEBUG
+  // =====================================================
+  if (millis() - lastSerialPrint >= SERIAL_PRINT_MS) {
+    lastSerialPrint = millis();
+    printDebug(currentMode);
+  }
+}
+
+// =====================================================
+// LCD / DEBUG
+// =====================================================
+void updateLCDMode(const char* modeText) {
+  lcd.setCursor(6, 1);
+  lcd.print("        ");
+  lcd.setCursor(6, 1);
+  lcd.print(modeText);
+}
+
+void updateLCDValues() {
+  lcd.setCursor(5, 2);
+  lcd.print("       ");
+  lcd.setCursor(5, 2);
+  lcd.print(LD2);
+
+  lcd.setCursor(5, 3);
+  lcd.print("   ");
+  lcd.setCursor(5, 3);
+  lcd.print(magLevel);
+}
+
+void printDebug(Mode currentMode) {
+  const char* modeText = modeToText(currentMode);
+
+  Serial.print(modeText);
+  Serial.print(" | LD1=");
+  Serial.print(LD1);
+  Serial.print(" LD2=");
+  Serial.print(LD2);
+  Serial.print(" LD2f=");
+  Serial.print((int)LD2_filtered);
+  Serial.print(" LD3=");
+  Serial.print(LD3);
+  Serial.print(" Mag=");
+  Serial.print(magLevel);
+  Serial.print(" | PWM+=");
+  Serial.print(dutyPos);
+  Serial.print(" PWM-=");
+  Serial.print(dutyNeg);
+  Serial.print(" | AutoMove=");
+  Serial.print(autoMovementFlag ? "1" : "0");
+  Serial.print(" Wait=");
+  Serial.print(waitingForContinue ? "1" : "0");
+  Serial.print(" Req=");
+  Serial.print(requestSent ? "1" : "0");
+  Serial.print(" StopLatch=");
+  Serial.print(stoppedAtStation ? "1" : "0");
+  Serial.print(" | WaitPerm=");
+  Serial.print(waitingForPermission ? "1" : "0");
+  Serial.print(" | WaitArr=");
+  Serial.print(waitingArrivalMessage);
+  Serial.print(" | WaitReq=");
+  Serial.print(waitingRequestMessage);
+  Serial.print(" | ArrMsg=");
+  Serial.print(currentStationMessage);
+  Serial.print(" | ReqMsg=");
+  Serial.print(currentRequestMessage);
+  Serial.print(" | LastCmd=");
+  Serial.print(lastCommand);
+  Serial.print(" | Step=");
+  Serial.print(commandedSpeedStep);
+  Serial.print(" Scale=");
+  Serial.println(commandedSpeedScale, 2);
+}
+
+// =====================================================
+// MOTOR CONTROL
+// =====================================================
+void stopMotors() {
+  ledcWrite(PWM_POS_PIN, 0);
+  ledcWrite(PWM_NEG_PIN, 0);
+  dutyPos = 0;
+  dutyNeg = 0;
+}
+
+void runManualFullSpeed() {
+  ledcWrite(PWM_POS_PIN, PWM_MAX);
+  ledcWrite(PWM_NEG_PIN, PWM_MAX);
+  dutyPos = PWM_MAX;
+  dutyNeg = PWM_MAX;
+}
+
+void MaglinTracking(int16_t LD21, uint16_t &dutyNeg1, uint16_t &dutyPos1) {
+  uint16_t basePos = PWM_MAX;
+  uint16_t baseNeg = PWM_MAX;
+
+  if      (LD21 > 100) basePos = 0;
+  else if (LD21 > 80)  basePos = 102;
+  else if (LD21 > 70)  basePos = 205;
+  else if (LD21 > 60)  basePos = 307;
+  else if (LD21 > 50)  basePos = 410;
+  else if (LD21 > 40)  basePos = 512;
+  else if (LD21 > 30)  basePos = 614;
+  else if (LD21 > 20)  basePos = 717;
+  else if (LD21 > 10)  basePos = 819;
+  else                 basePos = PWM_MAX;
+
+  if      (LD21 < -100) baseNeg = 0;
+  else if (LD21 < -80)  baseNeg = 102;
+  else if (LD21 < -70)  baseNeg = 205;
+  else if (LD21 < -60)  baseNeg = 307;
+  else if (LD21 < -50)  baseNeg = 410;
+  else if (LD21 < -40)  baseNeg = 512;
+  else if (LD21 < -30)  baseNeg = 614;
+  else if (LD21 < -20)  baseNeg = 717;
+  else if (LD21 < -10)  baseNeg = 819;
+  else                  baseNeg = PWM_MAX;
+
+  dutyPos1 = applySpeedScale(basePos);
+  dutyNeg1 = applySpeedScale(baseNeg);
+
+  ledcWrite(PWM_POS_PIN, dutyPos1);
+  ledcWrite(PWM_NEG_PIN, dutyNeg1);
+
+}
+// =====================================================
+// MASTER → AGV COMMAND LIST (SHORT)
+// =====================================================
+
+// CONTINUE
+// → Resume AUTO movement after station stop
+
+// CONTINUE_1 ... CONTINUE_15
+// → Resume AUTO movement + set speed (1 = slow, 15 = fast)
+
+// WAIT
+// → Stop and hold AGV at station (AUTO mode)
+
+// MOVE
+// → Force AGV to move again
+
+// STOP
+// → Force AGV to stop immediately
