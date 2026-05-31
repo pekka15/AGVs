@@ -1,0 +1,1994 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+#define NEXTION_RX 18
+#define NEXTION_TX 19
+
+typedef struct
+{
+  char text[32];
+} message;
+
+message msg;
+
+// =====================================================
+// OPERATING MODE + HMI REFRESH CONTROL
+// =====================================================
+int operatingMode = 0;
+bool hmiRefreshActive = false;
+unsigned long hmiRefreshStartTime = 0;
+unsigned long lastHMIRefresh = 0;
+
+
+
+bool agvChargingState[13] = {false};
+
+///buffernothing 
+bool preBuffer1Occupied = false;
+bool preBuffer2Occupied = false;
+bool preBuffer3Occupied = false;
+bool preBuffer4Occupied = false;
+bool preBuffer5Occupied = false;
+
+String preBuffer1AGV = "";
+String preBuffer2AGV = "";
+String preBuffer3AGV = "";
+String preBuffer4AGV = "";
+String preBuffer5AGV = "";
+// =====================================================
+// AGV MAC TABLE
+// =====================================================
+uint8_t agv1MAC[]  = {0x3C, 0x71, 0xBF, 0x7E, 0xB5, 0x5C};
+uint8_t agv2MAC[]  = {0x3C, 0x71, 0xBF, 0x7E, 0xDA, 0xCC}; 
+uint8_t agv3MAC[]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x03};
+uint8_t agv4MAC[]  = {0x00, 0x00, 0x00, 0x00, 0x10, 0x04};
+uint8_t agv5MAC[]  = {0x00, 0x00, 0x00, 0x10, 0x00, 0x05};
+uint8_t agv6MAC[]  = {0x00, 0x00, 0x10, 0x00, 0x00, 0x02};
+uint8_t agv7MAC[]  = {0x00, 0x10, 0x00, 0x00, 0x00, 0x03};
+uint8_t agv8MAC[]  = {0x20, 0x10, 0x00, 0x00, 0x00, 0x04};
+uint8_t agv9MAC[]  = {0x00, 0x00, 0x20, 0x00, 0x00, 0x05};
+uint8_t agv10MAC[] = {0x00, 0x00, 0x00, 0x20, 0x00, 0x02};
+uint8_t agv11MAC[] = {0x00, 0x00, 0x00, 0x00, 0x20, 0x03};
+uint8_t agv12MAC[] = {0x00, 0x00, 0x20, 0x00, 0x00, 0x04};
+
+struct AGVPeer
+{
+  const char *name;
+  uint8_t *mac;
+};
+
+AGVPeer agvs[] =
+{
+  {"AGV1",  agv1MAC},
+  {"AGV2",  agv2MAC},
+  {"AGV3",  agv3MAC},
+  {"AGV4",  agv4MAC},
+  {"AGV5",  agv5MAC},
+  {"AGV6",  agv6MAC},
+  {"AGV7",  agv7MAC},
+  {"AGV8",  agv8MAC},
+  {"AGV9",  agv9MAC},
+  {"AGV10", agv10MAC},
+  {"AGV11", agv11MAC},
+  {"AGV12", agv12MAC}
+};
+
+const int NUM_AGVS = sizeof(agvs) / sizeof(agvs[0]);
+
+
+////Used for operating mode 2 
+int continuousSpeed = 15;
+bool continuousLineStopped = false;
+// =====================================================
+// GLOBAL STATION STATES
+// =====================================================
+bool station1Occupied = false;
+bool station2Occupied = false;
+bool station3Occupied = false;
+bool station4Occupied = false;
+bool station5Occupied = false;
+bool station6Occupied = false;
+bool station7Occupied = false;
+bool bufferOccupied   = false;
+
+// =====================================================
+// AGV STORED AT EACH STATION
+// USED FOR OP 3 MASTER CONTROL MODE
+// =====================================================
+String station1AGV = "";
+String station2AGV = "";
+String station3AGV = "";
+String station4AGV = "";
+String station5AGV = "";
+String station6AGV = "";
+String station7AGV = "";
+String bufferAGV   = "";
+//global tracking in op2 
+String agvZone[13] = {
+  "", "", "", "", "", "", "", "", "", "", "", "", ""
+};
+// =====================================================
+// MODE
+// =====================================================
+bool stationModeEnabled = false;
+
+// =====================================================
+// NEXTION RX STATE
+// =====================================================
+String nextionBuffer = "";
+uint8_t ffCount = 0;
+unsigned long lastRequestTime = 0;
+const unsigned long requestInterval = 1000; // 1 second
+
+
+// =====================================================
+// FUNCTION DECLARATIONS
+// =====================================================
+void processIncomingMessageStation(String fullMessage);
+void processIncomingMessageCommand(String fullMessage);
+void moveAllAGVsOp3();
+void stopAllAGVsOp3();
+void processIncomingMessageContinuous(String fullMessage);
+void stopContinuousLine();
+void releaseContinuousEntry(const String &agvName, const String &station);
+void clearStationStorage(const String &station);
+void stopContinuousLineManual();
+void continueContinuousLineManual();
+void sendContinueWithCurrentSpeed(const String &agvName);
+void sendToAGVByName(const String &agvName, const char *cmd);
+void updateHMIStation(const String &stationName, bool occupied);
+void handleArrivalMessage(const String &agvName, const String &station);
+int getAGVIndexFromName(const String &agvName);
+void setAGVZone(const String &agvName, const String &zone);
+bool isAGVOnLine(const String &agvName);
+void setPreBufferOccupied(const String &slot, bool occupied);
+void clearPreBufferStorage(const String &slot);
+void handlePreBufferArrival(const String &agvName, const String &slot);
+bool isPreBufferOpen(const String &slot);
+void handlePreBufferMoveRequest(const String &agvName, const String &currentSlot);
+void updateAGVCharging(int agvNumber, bool charging);
+
+void advancePreBufferChain()
+{
+  if (!bufferOccupied && preBuffer1Occupied)
+  {
+    String agv = preBuffer1AGV;
+    clearPreBufferStorage("1");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB1 → BUFFER");
+  }
+
+  if (!preBuffer1Occupied && preBuffer2Occupied)
+  {
+    String agv = preBuffer2AGV;
+    clearPreBufferStorage("2");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB2 → PB1");
+  }
+
+  if (!preBuffer2Occupied && preBuffer3Occupied)
+  {
+    String agv = preBuffer3AGV;
+    clearPreBufferStorage("3");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB3 → PB2");
+  }
+
+  if (!preBuffer3Occupied && preBuffer4Occupied)
+  {
+    String agv = preBuffer4AGV;
+    clearPreBufferStorage("4");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB4 → PB3");
+  }
+
+  if (!preBuffer4Occupied && preBuffer5Occupied)
+  {
+    String agv = preBuffer5AGV;
+    clearPreBufferStorage("5");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB5 → PB4");
+  }
+}
+
+bool isStation7Active()
+{
+  return station7Occupied;
+}
+// =====================================================
+// CHARGING HMI UPDATE (ADDED)
+// =====================================================
+void updateAGVCharging(int agvNumber, bool charging)
+{
+  if (agvNumber < 1 || agvNumber > 12) return;
+
+  // 🔥 STORE STATE
+  agvChargingState[agvNumber] = charging;
+
+  // 🔥 UPDATE HMI (only if visible)
+  String cmd;
+
+  if (charging)
+  {
+    cmd = "tCharge" + String(agvNumber) + ".txt=\"Charging\"";
+    sendNextionCommand(cmd);
+
+    cmd = "tCharge" + String(agvNumber) + ".bco=2016";
+    sendNextionCommand(cmd);
+  }
+  else
+  {
+    cmd = "tCharge" + String(agvNumber) + ".txt=\"Not Charging\"";
+    sendNextionCommand(cmd);
+
+    cmd = "tCharge" + String(agvNumber) + ".bco=65504";
+    sendNextionCommand(cmd);
+  }
+
+  cmd = "ref tCharge" + String(agvNumber);
+  sendNextionCommand(cmd);
+
+  Serial.print("CHARGE UPDATE -> AGV");
+  Serial.println(agvNumber);
+}
+
+void refreshChargingHMI()
+{
+  for (int i = 1; i <= 12; i++)
+  {
+    updateAGVCharging(i, agvChargingState[i]);
+    delay(20); // prevent Nextion overload
+  }
+}
+
+
+void handleOperatingModeChange(int oldMode, int newMode)
+{
+  Serial.print("MODE CHANGE: ");
+  Serial.print(oldMode);
+  Serial.print(" -> ");
+  Serial.println(newMode);
+
+  // =====================================================
+  // OP2 / OP3 → OP1
+  // =====================================================
+  if (oldMode != newMode)
+  {
+    Serial.println("OP2/OP3 -> OP1: CLEAR stations + CONTINUE line");
+
+    // =====================================================
+    // 🔥 CLEAR STATION MEMORY ONLY (NOT agvZone!)
+    // =====================================================
+    station1Occupied = false;
+    station2Occupied = false;
+    station3Occupied = false;
+    station4Occupied = false;
+    station5Occupied = false;
+    station6Occupied = false;
+    station7Occupied = false;
+    bufferOccupied   = false;
+
+    station1AGV = "";
+    station2AGV = "";
+    station3AGV = "";
+    station4AGV = "";
+    station5AGV = "";
+    station6AGV = "";
+    station7AGV = "";
+    bufferAGV   = "";
+
+    // =====================================================
+    // REQUEST CURRENT AGV LOCATIONS
+    // =====================================================
+
+    Serial.println("Requesting AGV locations...");
+
+    for (int i = 1; i <= 12; i++)
+    {
+        String agvName = "AGV" + String(i);
+        sendToAGVByName(agvName, "REPORT_LOCATION");
+    }
+
+    delay(500);
+
+    Serial.println("Location rebuild complete");
+    // =====================================================
+    // 🔥 CONTINUE ALL AGVs ON THE LINE
+    // ====================================================
+
+    continuousLineStopped = false;
+  
+  }
+  delay(1500);
+
+// REFRESH HMI AFTER REBUILD
+  refreshHMIFromMemory();
+
+  Serial.println("HMI rebuild complete");
+    // =====================================================
+  // OP1 → OP2
+  // =====================================================
+  if (oldMode == 1 && newMode == 2)
+  {
+    Serial.println("Switching to OP2 -> apply continuous speed");
+
+    for (int i = 1; i <= 12; i++)
+    {
+      if (agvZone[i] == "ON_LINE")
+      {
+        String agvName = "AGV" + String(i);
+
+        sendContinueWithCurrentSpeed(agvName); // CONTINUE_X
+      }
+    }
+  }
+
+  // =====================================================
+  // ANY → OP3
+  // =====================================================
+  if (newMode == 3)
+  {
+    Serial.println("Switching to OP3 -> freeze system");
+
+    for (int i = 1; i <= 12; i++)
+    {
+      if (agvZone[i] == "ON_LINE")
+      {
+        String agvName = "AGV" + String(i);
+        // sendToAGVByName(agvName, "WAIT");
+      }
+    }
+  }
+}
+
+// =====================================================
+// PRE-BUFFER HELPERS
+// =====================================================
+void setPreBufferOccupied(const String &slot, bool occupied)
+{
+  if (slot == "1")
+  {
+    preBuffer1Occupied = occupied;
+    updateHMIStation("tsPreBuffer1", occupied);
+  }
+  else if (slot == "2")
+  {
+    preBuffer2Occupied = occupied;
+    updateHMIStation("tsPreBuffer2", occupied);
+  }
+  else if (slot == "3")
+  {
+    preBuffer3Occupied = occupied;
+    updateHMIStation("tsPreBuffer3", occupied);
+  }
+  else if (slot == "4")
+  {
+    preBuffer4Occupied = occupied;
+    updateHMIStation("tsPreBuffer4", occupied);
+  }
+  else if (slot == "5")
+  {
+    preBuffer5Occupied = occupied;
+    updateHMIStation("tsPreBuffer5", occupied);
+  }
+
+  Serial.print("PreBuffer ");
+  Serial.print(slot);
+  Serial.println(occupied ? " occupied" : " available");
+}
+
+void clearPreBufferStorage(const String &slot)
+{
+  setPreBufferOccupied(slot, false);
+
+  if (slot == "1") preBuffer1AGV = "";
+  else if (slot == "2") preBuffer2AGV = "";
+  else if (slot == "3") preBuffer3AGV = "";
+  else if (slot == "4") preBuffer4AGV = "";
+  else if (slot == "5") preBuffer5AGV = "";
+}
+
+void handlePreBufferArrival(const String &agvName, const String &slot)
+{
+  setPreBufferOccupied(slot, true);
+
+  if (slot == "1") preBuffer1AGV = agvName;
+  else if (slot == "2") preBuffer2AGV = agvName;
+  else if (slot == "3") preBuffer3AGV = agvName;
+  else if (slot == "4") preBuffer4AGV = agvName;
+  else if (slot == "5") preBuffer5AGV = agvName;
+
+  Serial.print(agvName);
+  Serial.print(" stored at PREBUFFER ");
+  Serial.println(slot);
+}
+
+bool isPreBufferOpen(const String &slot)
+{
+  if (slot == "1") return !preBuffer1Occupied;
+  if (slot == "2") return !preBuffer2Occupied;
+  if (slot == "3") return !preBuffer3Occupied;
+  if (slot == "4") return !preBuffer4Occupied;
+  if (slot == "5") return !preBuffer5Occupied;
+  return false;
+}
+
+void handlePreBufferMoveRequest(const String &agvName, const String &currentSlot)
+{
+  if (currentSlot == "5")
+  {
+    if (preBuffer5AGV == agvName)
+    {
+      if (!preBuffer4Occupied)
+      {
+        clearPreBufferStorage("5");
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 5 -> 4 allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("PREBUFFER 4 occupied, wait at PREBUFFER 5");
+      }
+    }
+    return;
+  }
+
+  if (currentSlot == "4")
+  {
+    if (preBuffer4AGV == agvName)
+    {
+      if (!preBuffer3Occupied)
+      {
+        clearPreBufferStorage("4"); 
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 4 -> 3 allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("PREBUFFER 3 occupied, wait at PREBUFFER 4");
+      }
+    }
+    return;
+  }
+
+  if (currentSlot == "3")
+  {
+    if (preBuffer3AGV == agvName)
+    {
+      if (!preBuffer2Occupied)
+      {
+        clearPreBufferStorage("3");
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 3 -> 2 allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("PREBUFFER 2 occupied, wait at PREBUFFER 3");
+      }
+    }
+    return;
+  }
+
+  if (currentSlot == "2")
+  {
+    if (preBuffer2AGV == agvName)
+    {
+      if (!preBuffer1Occupied)
+      {
+        clearPreBufferStorage("2"); 
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 2 -> 1 allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("PREBUFFER 1 occupied, wait at PREBUFFER 2");
+      }
+    }
+    return;
+  }
+
+  if (currentSlot == "1")
+  {
+    if (preBuffer1AGV == agvName)
+    {
+      if (!bufferOccupied)
+      {
+        clearPreBufferStorage("1");
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 1 -> BUFFER allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("BUFFER occupied, wait at PREBUFFER 1");
+      }
+    }
+    return;
+  }
+}
+
+
+int getAGVIndexFromName(const String &agvName)
+{
+  if (agvName.startsWith("AGV"))
+  {
+    return agvName.substring(3).toInt();
+  }
+  return 0;
+}
+
+void setAGVZone(const String &agvName, const String &zone)
+{  
+  Serial.print("ZONE -> ");
+  Serial.print(agvName);
+  Serial.println(" = ON_LINE");
+  int idx = getAGVIndexFromName(agvName);
+
+  if (idx >= 1 && idx <= 12)
+  {
+    agvZone[idx] = zone;
+
+    Serial.print("ZONE -> ");
+    Serial.print(agvName);
+    Serial.print(" = ");
+    Serial.println(zone);
+  }
+}
+
+bool isAGVOnLine(const String &agvName)
+{
+  int idx = getAGVIndexFromName(agvName);
+
+  if (idx >= 1 && idx <= 12)
+  {
+    return agvZone[idx] == "ON_LINE";
+  }
+
+  return false;
+}
+void stopContinuousLine()
+{
+  Serial.println("=================================");
+  Serial.println("OP 2 -> STOP CONTINUOUS LINE");
+  Serial.println("=================================");
+
+  continuousLineStopped = true;
+
+  for (int i = 1; i <= 12; i++)
+  {
+    if (agvZone[i] == "ON_LINE")
+    {
+      String agvName = "AGV" + String(i);
+      sendToAGVByName(agvName, "WAIT");
+    }
+  }
+
+  Serial.println("Continuous line stopped");
+}
+
+void stopContinuousLineManual()
+{
+  Serial.println("=================================");
+  Serial.println("OP 2 -> STOP CONTINUOUS LINE");
+  Serial.println("=================================");
+
+  continuousLineStopped = true;
+
+  for (int i = 1; i <= 12; i++)
+  {
+    if (agvZone[i] == "ON_LINE")
+    {
+      String agvName = "AGV" + String(i);
+      sendToAGVByName(agvName, "WAIT");
+    }
+  }
+
+  Serial.println("Continuous line stopped");
+}
+
+void continueContinuousLineManual()
+{
+  Serial.println("=================================");
+  Serial.println("OP 2 -> MANUAL CONTINUE LINE");
+  Serial.println("=================================");
+
+  continuousLineStopped = false;
+
+  for (int i = 1; i <= 12; i++)
+  {
+    if (agvZone[i] == "ON_LINE")
+    {
+      String agvName = "AGV" + String(i);
+      sendContinueWithCurrentSpeed(agvName);
+    }
+  }
+
+  Serial.print("Continuous line resumed at speed ");
+  Serial.println(continuousSpeed);
+}
+
+void clearStationStorage(const String &station)
+{
+  if (station == "1")
+  {
+    station1Occupied = false;
+    station1AGV = "";
+    updateHMIStation("tsstatus1", station1Occupied);
+  }
+  else if (station == "2")
+  {
+    station2Occupied = false;
+    station2AGV = "";
+    updateHMIStation("tsstatus2", station2Occupied);
+  }
+  else if (station == "3")
+  {
+    station3Occupied = false;
+    station3AGV = "";
+    updateHMIStation("tsstatus3", station3Occupied);
+  }
+  else if (station == "4")
+  {
+    station4Occupied = false;
+    station4AGV = "";
+    updateHMIStation("tsstatus4", station4Occupied);
+  }
+  else if (station == "5")
+  {
+    station5Occupied = false;
+    station5AGV = "";
+    updateHMIStation("tsstatus5", station5Occupied);
+  }
+  else if (station == "6")
+  {
+    station6Occupied = false;
+    station6AGV = "";
+    updateHMIStation("tsstatus6", station6Occupied);
+  }
+  else if (station == "7")
+  {
+    station7Occupied = false;
+    station7AGV = "";
+    updateHMIStation("tsstatus7", station7Occupied);
+  }
+  else if (station == "BUFFER")
+  {
+    bufferOccupied = false;
+    bufferAGV = "";
+    updateHMIStation("tsstatus8", bufferOccupied);
+  }
+}
+/////////operating mode 2 code
+void sendContinueWithCurrentSpeed(const String &agvName)
+{
+  char cmd[20];
+  snprintf(cmd, sizeof(cmd), "CONTINUE_%d", continuousSpeed);
+  sendToAGVByName(agvName, cmd);
+}
+
+
+void releaseContinuousEntry(const String &agvName, const String &station)
+{
+  if (continuousLineStopped)
+  {
+    sendToAGVByName(agvName, "WAIT");
+    Serial.println("Continuous line stopped -> WAIT");
+    return;
+  }
+
+  Serial.print("RELEASE -> ");
+  Serial.print(agvName);
+  Serial.print(" from station ");
+  Serial.println(station);
+
+  clearStationStorage(station);
+
+  if (station == "1")
+  {
+    setAGVZone(agvName, "ON_LINE");
+  }
+  else if (station == "BUFFER")
+  {
+    setAGVZone(agvName, "AT_1_PENDING");
+  }
+
+  // 🔥 SPEED LOGIC HERE
+  if (station == "BUFFER")
+  {
+    sendToAGVByName(agvName, "CONTINUE_15");   // full speed
+  }
+  else
+  {
+    sendContinueWithCurrentSpeed(agvName);  // controlled speed
+  }
+
+  Serial.print("Released ");
+  Serial.print(agvName);
+  Serial.print(" from ");
+  Serial.println(station);
+}
+
+// =====================================================
+// MESSAGE PARSER - OP 2 (CONTINUOUS LINE)
+// =====================================================
+void processIncomingMessageContinuous(String fullMessage)
+{
+  fullMessage.trim();
+  fullMessage.toUpperCase();
+  fullMessage.replace(" ", "_");
+
+  int colonIndex = fullMessage.indexOf(':');
+  if (colonIndex == -1)
+  {
+    Serial.println("Invalid message format");
+    return;
+  }
+
+  String agvName = fullMessage.substring(0, colonIndex);
+  String command = fullMessage.substring(colonIndex + 1);
+  // =====================================================
+// MAP STATION 8-13 TO PREBUFFER SYSTEM
+// =====================================================
+
+  if      (command == "AT_STATION_8")  command = "AT_PREBUFFER_5";
+  else if (command == "AT_STATION_9")  command = "AT_PREBUFFER_4";
+  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_3";
+  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_2";
+  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_1";
+  else if (command == "AT_STATION_13") command = "AT_BUFFER";
+
+  else if (command == "REQUEST_STATION_8")  command = "REQUEST_PREBUFFER_5";
+  else if (command == "REQUEST_STATION_9")  command = "REQUEST_PREBUFFER_4";
+  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_3";
+  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_2";
+  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_1";
+  else if (command == "REQUEST_STATION_13") command = "REQUEST_BUFFER";
+
+
+  Serial.print("PROCESS OP2 -> ");
+  Serial.println(fullMessage);
+  // =====================================================
+  // ARRIVALS
+  // =====================================================
+// =====================================================
+// PREBUFFER REQUESTS
+// =====================================================
+
+  if (command == "REQUEST_PREBUFFER_5")
+  {
+      handlePreBufferMoveRequest(agvName, "5");
+      return;
+  }
+  else if (command == "REQUEST_PREBUFFER_4")
+  {
+      handlePreBufferMoveRequest(agvName, "4");
+      return;
+  }
+  else if (command == "REQUEST_PREBUFFER_3")
+  {
+      handlePreBufferMoveRequest(agvName, "3");
+      return;
+  }
+  else if (command == "REQUEST_PREBUFFER_2")
+  {
+      handlePreBufferMoveRequest(agvName, "2");
+      return;
+  }
+  else if (command == "REQUEST_PREBUFFER_1")
+  {
+      handlePreBufferMoveRequest(agvName, "1");
+      return;
+  }
+  
+  if (command == "AT_STATION_1")
+  {
+    handleArrivalMessage(agvName, "1");
+
+  }
+  else if (command == "AT_STATION_2")
+  {
+    handleArrivalMessage(agvName, "2");
+
+    if (!continuousLineStopped)
+    {
+      clearStationStorage("2");
+      sendContinueWithCurrentSpeed(agvName);
+    }
+  }
+  else if (command == "AT_STATION_3")
+  {
+    handleArrivalMessage(agvName, "3");
+
+    if (!continuousLineStopped)
+    {
+      clearStationStorage("3");
+      sendContinueWithCurrentSpeed(agvName);
+    }
+  }
+  else if (command == "AT_STATION_4")
+  {
+    handleArrivalMessage(agvName, "4");
+
+    if (!continuousLineStopped)
+    {
+      clearStationStorage("4");
+      sendContinueWithCurrentSpeed(agvName);
+    }
+  }
+  else if (command == "AT_STATION_5")
+  {
+    handleArrivalMessage(agvName, "5");
+
+    if (!continuousLineStopped)
+    {
+      clearStationStorage("5");
+      sendContinueWithCurrentSpeed(agvName);
+    }
+  }
+  else if (command == "AT_STATION_6")
+  {
+    handleArrivalMessage(agvName, "6");
+
+    if (!continuousLineStopped)
+    {
+      clearStationStorage("6");
+      sendContinueWithCurrentSpeed(agvName);
+    }
+  }
+  else if (command == "AT_STATION_7")
+  {
+    Serial.println("AGV reached STATION 7 -> STOP LINE");
+
+    station7Occupied = true;
+    station7AGV = agvName;
+
+    updateHMIStation("tsstatus7", true);
+
+    // 🔥 STOP ENTIRE LINE
+    stopContinuousLine();
+  }
+  else if (command == "AT_BUFFER")
+  {
+    Serial.println("AGV reached BUFFER");
+
+    handleArrivalMessage(agvName, "BUFFER");
+
+    return;
+  }
+  else if (command == "REQUEST_BUFFER")
+  {
+    if (bufferAGV == agvName)
+    {
+      if (!station1Occupied)
+      {
+        Serial.println("OP2 -> BUFFER → STATION 1 allowed");
+
+        clearStationStorage("BUFFER");
+
+        // AGV not on line yet
+        setAGVZone(agvName, "AT_1_PENDING");
+
+        // Move from buffer to station 1
+        sendToAGVByName(agvName, "CONTINUE_15");
+
+        advancePreBufferChain();
+        return;
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("Station 1 occupied, wait at BUFFER");
+        return;
+      }
+    }
+  }
+
+  // =====================================================
+  // REQUESTS
+  // =====================================================
+  else if (command == "REQUEST_STATION_1")
+  {
+    if (station1AGV == agvName)
+    {
+      releaseContinuousEntry(agvName, "1"); 
+    }
+  }
+  
+  else if (command == "REQUEST_STATION_7")
+  {
+      if (station7AGV == agvName)
+      {
+          clearStationStorage("7");
+
+          // Release AGV at station 7 out of the line
+          sendToAGVByName(agvName, "CONTINUE_15");
+
+          setAGVZone(agvName, "OFF_LINE");
+
+          continuousLineStopped = false;
+
+          // Resume all AGVs already on the line
+          for (int i = 1; i <= 12; i++)
+          {
+              String otherAgv = "AGV" + String(i);
+
+              if (agvZone[i] == "ON_LINE" && otherAgv != agvName)
+              {
+                  sendContinueWithCurrentSpeed(otherAgv);
+              }
+          }
+      }
+  }
+
+  else if (command == "CHARGING")
+  {
+    int agvNum = getAGVIndexFromName(agvName);
+    updateAGVCharging(agvNum, true);
+    return;
+  }
+
+  else if (command == "NOT_CHARGING")
+  {
+    int agvNum = getAGVIndexFromName(agvName);
+    updateAGVCharging(agvNum, false);
+    return;
+  }
+  else if (command == "AT_PREBUFFER_5") handlePreBufferArrival(agvName, "5");
+  else if (command == "AT_PREBUFFER_4") handlePreBufferArrival(agvName, "4");
+  else if (command == "AT_PREBUFFER_3") handlePreBufferArrival(agvName, "3");
+  else if (command == "AT_PREBUFFER_2") handlePreBufferArrival(agvName, "2");
+  else if (command == "AT_PREBUFFER_1") handlePreBufferArrival(agvName, "1");
+  // =====================================================
+  // UNKNOWN
+  // =====================================================
+  else
+  {
+    Serial.print("Unknown OP2 command: ");
+    Serial.println(command);
+  }
+}
+
+
+// =====================================================
+// OPERATING MODE LOGIC
+// =====================================================
+
+// =====================================================
+// NEXTION
+// =====================================================
+void sendNextionCommand(const String &cmd)
+{
+  Serial2.print(cmd);
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+  Serial2.write(0xFF);
+
+  Serial.print("HMI <- ");
+  Serial.println(cmd);
+}
+
+void updateHMIStation(const String &stationName, bool occupied)
+{
+  String text = occupied ? "Occupied" : "Available";
+  sendNextionCommand(stationName + ".txt=\"" + text + "\"");
+}
+
+void clearSystemMemory()
+{
+  station1Occupied = false;
+  station2Occupied = false;
+  station3Occupied = false;
+  station4Occupied = false;
+  station5Occupied = false;
+  station6Occupied = false;
+  station7Occupied = false;
+  bufferOccupied   = false;
+
+  station1AGV = "";
+  station2AGV = "";
+  station3AGV = "";
+  station4AGV = "";
+  station5AGV = "";
+  station6AGV = "";
+  station7AGV = "";
+  bufferAGV   = "";
+
+  preBuffer1Occupied = false;
+  preBuffer2Occupied = false;
+  preBuffer3Occupied = false;
+  preBuffer4Occupied = false;
+  preBuffer5Occupied = false;
+
+  preBuffer1AGV = "";
+  preBuffer2AGV = "";
+  preBuffer3AGV = "";
+  preBuffer4AGV = "";
+  preBuffer5AGV = "";
+    for (int i = 1; i <= 12; i++)
+  {
+    agvZone[i] = "";
+  }
+}
+
+void refreshHMIFromMemory()
+{
+  updateHMIStation("tsstatus1", station1Occupied); delay(20);
+  updateHMIStation("tsstatus2", station2Occupied); delay(20);
+  updateHMIStation("tsstatus3", station3Occupied); delay(20);
+  updateHMIStation("tsstatus4", station4Occupied); delay(20);
+  updateHMIStation("tsstatus5", station5Occupied); delay(20);
+  updateHMIStation("tsstatus6", station6Occupied); delay(20);
+  updateHMIStation("tsstatus7", station7Occupied); delay(20);
+  updateHMIStation("tsstatus8", bufferOccupied);   delay(20);
+}
+
+void startHMIRefreshWindow()
+{
+  hmiRefreshActive = true;
+  hmiRefreshStartTime = millis();
+  lastHMIRefresh = 0;
+}
+
+// =====================================================
+// AGV HELPERS
+// =====================================================
+int getAGVNumberFromMAC(const uint8_t *mac)
+{
+  for (int i = 0; i < NUM_AGVS; i++)
+  {
+    if (memcmp(mac, agvs[i].mac, 6) == 0)
+    {
+      return i + 1;
+    }
+  }
+  return -1;
+}
+
+void sendToAGVByName(const String &agvName, const char *cmd)
+{
+  memset(&msg, 0, sizeof(msg));
+  strncpy(msg.text, cmd, sizeof(msg.text) - 1);
+
+  for (int i = 0; i < NUM_AGVS; i++)
+  {
+    if (agvName.equalsIgnoreCase(agvs[i].name))
+    {
+      esp_now_send(agvs[i].mac, (uint8_t *)&msg, sizeof(msg));
+
+      Serial.print("MASTER -> ");
+      Serial.print(agvName);
+      Serial.print(": ");
+      Serial.println(cmd);
+      return;
+    }
+  }
+
+  Serial.print("Unknown AGV name: ");
+  Serial.println(agvName);
+}
+
+// =====================================================
+// STATION ACTION HELPERS
+// =====================================================
+void setStationOccupied(const String &station)
+{
+  if (station == "1")
+  {
+    station1Occupied = true;
+    updateHMIStation("tsstatus1", station1Occupied);
+    Serial.println("Station 1 occupied");
+  }
+  else if (station == "2")
+  {
+    station2Occupied = true;
+    updateHMIStation("tsstatus2", station2Occupied);
+    Serial.println("Station 2 occupied");
+  }
+  else if (station == "3")
+  {
+    station3Occupied = true;
+    updateHMIStation("tsstatus3", station3Occupied);
+    Serial.println("Station 3 occupied");
+  }
+  else if (station == "4")
+  {
+    station4Occupied = true;
+    updateHMIStation("tsstatus4", station4Occupied);
+    Serial.println("Station 4 occupied");
+  }
+  else if (station == "5")
+  {
+    station5Occupied = true;
+    updateHMIStation("tsstatus5", station5Occupied);
+    Serial.println("Station 5 occupied");
+  }
+  else if (station == "6")
+  {
+    station6Occupied = true;
+    updateHMIStation("tsstatus6", station6Occupied);
+    Serial.println("Station 6 occupied");
+  }
+  else if (station == "7")
+  {
+    station7Occupied = true;
+    updateHMIStation("tsstatus7", station7Occupied);
+    Serial.println("Station 7 occupied");
+  }
+  else if (station == "BUFFER")
+  {
+    bufferOccupied = true;
+    updateHMIStation("tsstatus8", bufferOccupied);
+    Serial.println("Buffer occupied");
+  }
+}
+
+void handleArrivalMessage(const String &agvName, const String &station)
+{
+  setStationOccupied(station);
+
+  if (station == "1")
+  {
+    station1AGV = agvName;
+    setAGVZone(agvName, "AT_1");
+  }
+  else if (station == "2")
+  {
+    station2AGV = agvName;
+    setAGVZone(agvName, "ON_LINE");
+  }
+  else if (station == "3")
+  {
+    station3AGV = agvName;
+    setAGVZone(agvName, "ON_LINE");
+  }
+  else if (station == "4")
+  {
+    station4AGV = agvName;
+    setAGVZone(agvName, "ON_LINE");
+  }
+  else if (station == "5")
+  {
+    station5AGV = agvName;
+    setAGVZone(agvName, "ON_LINE");
+  }
+  else if (station == "6")
+  {
+    station6AGV = agvName;
+    setAGVZone(agvName, "ON_LINE");
+  }
+  else if (station == "7")
+  {
+    station7AGV = agvName;
+    setAGVZone(agvName, "AT_7");
+  }
+  else if (station == "BUFFER")
+  {
+    bufferAGV = agvName;
+    setAGVZone(agvName, "BUFFER");
+  }
+
+  Serial.print(agvName);
+  Serial.print(" stored at station ");
+  Serial.println(station);
+}
+
+// =====================================================
+// OP 1 FUNCTIONS
+// =====================================================
+void handleMoveRequest(const String &agvName, const String &currentStation)
+{
+  if (!stationModeEnabled)
+  {
+    Serial.println("Station mode not enabled -> WAIT");
+    sendToAGVByName(agvName, "WAIT");
+    return;
+  }
+
+    if (currentStation == "1")
+    {
+      if (!station2Occupied)
+      {
+      station1Occupied = false;
+      station1AGV = "";
+      updateHMIStation("tsstatus1", station1Occupied);
+
+      setAGVZone(agvName, "ON_LINE");
+
+      Serial.print("ZONE -> ");
+      Serial.print(agvName);
+      Serial.println(" = ON_LINE");
+
+      sendToAGVByName(agvName, "CONTINUE");
+    }
+  else
+  {
+    sendToAGVByName(agvName, "WAIT");
+    Serial.println("Station 2 occupied, wait");
+  }
+}
+  else if (currentStation == "2")
+  {
+    if (!station3Occupied)
+    {
+      station2Occupied = false;
+      updateHMIStation("tsstatus2", station2Occupied);
+      sendToAGVByName(agvName, "CONTINUE");
+      station2AGV = "";
+    }
+    else
+    {
+      sendToAGVByName(agvName, "WAIT");
+      Serial.println("Station 3 occupied, wait");
+    }
+  }
+  else if (currentStation == "3")
+  {
+    if (!station4Occupied)
+    {
+      station3Occupied = false;
+      updateHMIStation("tsstatus3", station3Occupied);
+      sendToAGVByName(agvName, "CONTINUE");
+      station3AGV = "";
+    }
+    else
+    {
+      sendToAGVByName(agvName, "WAIT");
+      Serial.println("Station 4 occupied, wait");
+    }
+  }
+  else if (currentStation == "4")
+  {
+    if (!station5Occupied)
+    {
+      station4Occupied = false;
+      updateHMIStation("tsstatus4", station4Occupied);
+      sendToAGVByName(agvName, "CONTINUE");
+      station4AGV = "";
+    }
+    else
+    {
+      sendToAGVByName(agvName, "WAIT");
+      Serial.println("Station 5 occupied, wait");
+    }
+  }
+  else if (currentStation == "5")
+  {
+    if (!station6Occupied)
+    {
+      station5Occupied = false;
+      updateHMIStation("tsstatus5", station5Occupied);
+      sendToAGVByName(agvName, "CONTINUE");
+      station5AGV = "";
+    }
+    else
+    {
+      sendToAGVByName(agvName, "WAIT");
+      Serial.println("Station 6 occupied, wait");
+    }
+  }
+  else if (currentStation == "6")
+  {
+    if (!station7Occupied)
+    {
+      station6Occupied = false;
+      updateHMIStation("tsstatus6", station6Occupied);
+      sendToAGVByName(agvName, "CONTINUE");
+      station6AGV = "";
+    }
+    else
+    {
+      sendToAGVByName(agvName, "WAIT");
+      Serial.println("Station 7 occupied, wait");
+    }
+  }
+  else if (currentStation == "7")
+  {
+    station7Occupied = false;
+    updateHMIStation("tsstatus7", station7Occupied);
+    sendToAGVByName(agvName, "CONTINUE_15");
+    station7AGV = "";
+  }
+  else if (currentStation == "BUFFER")
+  {
+    if (!station1Occupied)
+    {
+      bufferOccupied = false;
+      updateHMIStation("tsstatus8", bufferOccupied);
+      sendToAGVByName(agvName, "CONTINUE_15");
+      bufferAGV = "";
+    }
+    else
+    {
+      sendToAGVByName(agvName, "WAIT");
+      Serial.println("Station 1 occupied, wait in buffer");
+    }
+  }
+}
+
+// =====================================================
+// MESSAGE PARSER - OP 1
+// =====================================================
+void processIncomingMessageStation(String fullMessage)
+{
+  fullMessage.trim();
+  fullMessage.toUpperCase();
+  fullMessage.replace(" ", "_");
+
+  int colonIndex = fullMessage.indexOf(':');
+  if (colonIndex < 0)
+  {
+    Serial.print("Invalid message: ");
+    Serial.println(fullMessage);
+    return;
+  }
+
+  String agvName  = fullMessage.substring(0, colonIndex);
+  String command  = fullMessage.substring(colonIndex + 1);
+  // =====================================================
+// MAP STATION 8-13 TO PREBUFFER SYSTEM
+// =====================================================
+  
+  if      (command == "AT_STATION_8")  command = "AT_PREBUFFER_5";
+  else if (command == "AT_STATION_9")  command = "AT_PREBUFFER_4";
+  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_3";
+  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_2";
+  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_1";
+  else if (command == "AT_STATION_13") command = "AT_BUFFER";
+
+  else if (command == "REQUEST_STATION_8")  command = "REQUEST_PREBUFFER_5";
+  else if (command == "REQUEST_STATION_9")  command = "REQUEST_PREBUFFER_4";
+  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_3";
+  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_2";
+  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_1";
+  else if (command == "REQUEST_STATION_13") command = "REQUEST_BUFFER";
+  Serial.print("PROCESS OP1 -> ");
+  Serial.println(fullMessage);
+  if (command == "CHARGING")
+  {
+    int agvNum = getAGVIndexFromName(agvName);
+    updateAGVCharging(agvNum, true);
+    return;
+  }
+
+  if (command == "NOT_CHARGING")
+  {
+    int agvNum = getAGVIndexFromName(agvName);
+    updateAGVCharging(agvNum, false);
+    return;
+  }
+  if      (command == "AT_STATION_1") handleArrivalMessage(agvName, "1");
+  else if (command == "AT_STATION_2") handleArrivalMessage(agvName, "2");
+  else if (command == "AT_STATION_3") handleArrivalMessage(agvName, "3");
+  else if (command == "AT_STATION_4") handleArrivalMessage(agvName, "4");
+  else if (command == "AT_STATION_5") handleArrivalMessage(agvName, "5");
+  else if (command == "AT_STATION_6") handleArrivalMessage(agvName, "6");
+  else if (command == "AT_STATION_7") handleArrivalMessage(agvName, "7");
+  else if (command == "AT_BUFFER")    handleArrivalMessage(agvName, "BUFFER");
+  else if (command == "REQUEST_STATION_1") handleMoveRequest(agvName, "1");
+  else if (command == "REQUEST_STATION_2") handleMoveRequest(agvName, "2");
+  else if (command == "REQUEST_STATION_3") handleMoveRequest(agvName, "3");
+  else if (command == "REQUEST_STATION_4") handleMoveRequest(agvName, "4");
+  else if (command == "REQUEST_STATION_5") handleMoveRequest(agvName, "5");
+  else if (command == "REQUEST_STATION_6") handleMoveRequest(agvName, "6");
+  else if (command == "REQUEST_STATION_7") handleMoveRequest(agvName, "7");
+  else if (command == "REQUEST_BUFFER")    handleMoveRequest(agvName, "BUFFER");
+ 
+  else if (command == "AT_PREBUFFER_5") handlePreBufferArrival(agvName, "5");
+  else if (command == "AT_PREBUFFER_4") handlePreBufferArrival(agvName, "4");
+  else if (command == "AT_PREBUFFER_3") handlePreBufferArrival(agvName, "3");
+  else if (command == "AT_PREBUFFER_2") handlePreBufferArrival(agvName, "2");
+  else if (command == "AT_PREBUFFER_1") handlePreBufferArrival(agvName, "1");
+
+  else if (command == "REQUEST_PREBUFFER_5")
+  {
+      handlePreBufferArrival(agvName, "5");
+      handlePreBufferMoveRequest(agvName, "5");
+  }
+  else if (command == "REQUEST_PREBUFFER_4")
+  {
+      handlePreBufferArrival(agvName, "4");
+      handlePreBufferMoveRequest(agvName, "4");
+  }
+  else if (command == "REQUEST_PREBUFFER_3")
+  {
+      handlePreBufferArrival(agvName, "3");
+      handlePreBufferMoveRequest(agvName, "3");
+  }
+  else if (command == "REQUEST_PREBUFFER_2")
+  {
+      handlePreBufferArrival(agvName, "2");
+      handlePreBufferMoveRequest(agvName, "2");
+  }
+  else if (command == "REQUEST_PREBUFFER_1")
+  {
+      handlePreBufferArrival(agvName, "1");
+      handlePreBufferMoveRequest(agvName, "1");
+  }
+ 
+  else
+  {
+    Serial.print("Unknown OP1 command: ");
+    Serial.println(command);
+  }
+}
+
+// =====================================================
+// PROCESS PENDING MESSAGE - OP 2
+// =====================================================
+
+// =====================================================
+// PROCESS PENDING MESSAGE - OP 3
+// =====================================================
+
+// =====================================================
+// MESSAGE PARSER - OP 3
+// =====================================================
+void processIncomingMessageCommand(String fullMessage)
+{
+  fullMessage.trim();
+  fullMessage.toUpperCase();
+  fullMessage.replace(" ", "_");
+
+  int colonIndex = fullMessage.indexOf(':');
+  if (colonIndex < 0)
+  {
+    Serial.print("Invalid message: ");
+    Serial.println(fullMessage);
+    return;
+  }
+
+  String agvName  = fullMessage.substring(0, colonIndex);
+  String command  = fullMessage.substring(colonIndex + 1);
+  // =====================================================
+// MAP STATION 8-13 TO PREBUFFER SYSTEM
+// =====================================================
+
+  if      (command == "AT_STATION_8")  command = "AT_PREBUFFER_5";
+  else if (command == "AT_STATION_9")  command = "AT_PREBUFFER_4";
+  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_3";
+  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_2";
+  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_1";
+  else if (command == "AT_STATION_13") command = "AT_BUFFER";
+
+  else if (command == "REQUEST_STATION_8")  command = "REQUEST_PREBUFFER_5";
+  else if (command == "REQUEST_STATION_9")  command = "REQUEST_PREBUFFER_4";
+  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_3";
+  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_2";
+  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_1";
+  else if (command == "REQUEST_STATION_13") command = "REQUEST_BUFFER";
+  Serial.print("PROCESS OP3 -> ");
+  Serial.println(fullMessage);
+
+  
+  if (command == "CHARGING")
+  {
+    int agvNum = getAGVIndexFromName(agvName);
+    updateAGVCharging(agvNum, true);
+    return;
+  }
+
+  if (command == "NOT_CHARGING")
+  {
+    int agvNum = getAGVIndexFromName(agvName);
+    updateAGVCharging(agvNum, false);
+    return;
+  }
+
+  if      (command == "AT_STATION_1") handleArrivalMessage(agvName, "1");
+  else if (command == "AT_STATION_2") handleArrivalMessage(agvName, "2");
+  else if (command == "AT_STATION_3") handleArrivalMessage(agvName, "3");
+  else if (command == "AT_STATION_4") handleArrivalMessage(agvName, "4");
+  else if (command == "AT_STATION_5") handleArrivalMessage(agvName, "5");
+  else if (command == "AT_STATION_6") handleArrivalMessage(agvName, "6");
+  else if (command == "AT_STATION_7") handleArrivalMessage(agvName, "7");
+  else if (command == "AT_BUFFER")    handleArrivalMessage(agvName, "BUFFER");
+  else if (command == "AT_PREBUFFER_5") handlePreBufferArrival(agvName, "5");
+  else if (command == "AT_PREBUFFER_4") handlePreBufferArrival(agvName, "4");
+  else if (command == "AT_PREBUFFER_3") handlePreBufferArrival(agvName, "3");
+  else if (command == "AT_PREBUFFER_2") handlePreBufferArrival(agvName, "2");
+  else if (command == "AT_PREBUFFER_1") handlePreBufferArrival(agvName, "1");
+
+  else if (command == "REQUEST_PREBUFFER_5")
+  {
+      handlePreBufferArrival(agvName, "5");
+      handlePreBufferMoveRequest(agvName, "5");
+  }
+  else if (command == "REQUEST_PREBUFFER_4")
+  {
+      handlePreBufferArrival(agvName, "4");
+      handlePreBufferMoveRequest(agvName, "4");
+  }
+  else if (command == "REQUEST_PREBUFFER_3")
+  {
+      handlePreBufferArrival(agvName, "3");
+      handlePreBufferMoveRequest(agvName, "3");
+  }
+  else if (command == "REQUEST_PREBUFFER_2")
+  {
+      handlePreBufferArrival(agvName, "2");
+      handlePreBufferMoveRequest(agvName, "2");
+  }
+  else if (command == "REQUEST_PREBUFFER_1")
+  {
+      handlePreBufferArrival(agvName, "1");
+      handlePreBufferMoveRequest(agvName, "1");
+  }
+  else if (command == "REQUEST_STATION_7")
+  {
+    if (station7AGV == agvName)
+    {
+      Serial.println("OP3 -> RELEASE FROM STATION 7");
+
+      clearStationStorage("7");
+
+        // 🔥 RELEASE AGV
+      sendToAGVByName(agvName, "CONTINUE_15");
+
+        // 🔥 REMOVE FROM SYSTEM CONTROL
+      setAGVZone(agvName, "OFF_LINE");
+
+      Serial.print("REMOVED FROM CONTROL: ");
+      Serial.println(agvName);
+    }
+  }
+  else if (command == "REQUEST_BUFFER")
+  {
+    if (bufferAGV == agvName)
+    {
+      if (!station1Occupied)   // 🔥 ADD THIS CHECK
+      {
+        Serial.println("OP3 -> BUFFER → STATION 1");
+
+        releaseContinuousEntry(agvName, "BUFFER");
+        advancePreBufferChain();
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("Station 1 occupied, wait at BUFFER");
+      }
+    }
+  }
+  else if (command == "REQUEST_STATION_1")
+  {
+    if (station1AGV == agvName)
+    {
+      if (!station2Occupied)
+      {
+        Serial.println("OP3 -> STATION 1 → 2");
+
+        releaseContinuousEntry(agvName, "1");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("Station 2 occupied, wait at Station 1");
+      }
+    }
+  }
+
+}
+// =====================================================
+// OP 3 FUNCTIONS
+// =====================================================
+void moveAllAGVsOp3()
+{
+  Serial.println("=================================");
+  Serial.println("OP 3 -> MOVE ALL AGVS BETWEEN 1 AND 7");
+  Serial.println("=================================");
+
+  for (int i = 1; i <= 12; i++)
+  {
+    if (agvZone[i] == "ON_LINE")   // 🔥 ONLY ACTIVE AGVS
+    {
+      String agvName = "AGV" + String(i);
+
+      sendToAGVByName(agvName, "CONTINUE_15");
+
+      Serial.print("MOVE -> ");
+      Serial.println(agvName);
+    }
+  }
+}
+
+
+void stopAllAGVsOp3()
+{
+  Serial.println("=================================");
+  Serial.println("OP 3 -> STOP ALL AGVS");
+  Serial.println("=================================");
+
+  for (int i = 1; i <= 12; i++)
+  {
+    if (agvZone[i] == "ON_LINE")   // 🔥 ONLY ACTIVE AGVS
+    {
+      String agvName = "AGV" + String(i);
+
+      sendToAGVByName(agvName, "WAIT");
+
+      Serial.print("STOP -> ");
+      Serial.println(agvName);
+    }
+  }
+}
+
+// =====================================================
+// ESP-NOW RECEIVE
+// =====================================================
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+
+  // 🔥 DEBUG: PRINT SENDER MAC
+  Serial.print("RX FROM: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.print(info->src_addr[i], HEX);
+    if (i < 5) Serial.print(":");
+  }
+  Serial.println();
+  // ==========================================
+  // READ MESSAGE (YOUR ORIGINAL METHOD)
+  // ==========================================
+  message incomingMsg;
+  memset(&incomingMsg, 0, sizeof(incomingMsg));
+  memcpy(&incomingMsg, data, min(len, (int)sizeof(incomingMsg)));
+
+  String incoming = String(incomingMsg.text);
+  incoming.trim();
+  incoming.toUpperCase();
+
+  int agvNumber = getAGVNumberFromMAC(info->src_addr);
+
+  if (agvNumber < 0)
+  {
+    Serial.println("Unknown AGV MAC");
+    return;
+  }
+
+  Serial.print("RX AGV");
+  Serial.print(agvNumber);
+  Serial.print(" -> ");
+  Serial.println(incoming);
+
+  // ==========================================
+  // CHARGING HANDLING (NEW)
+  // ==========================================
+  if (incoming == "CHARGING")
+  {
+    updateAGVCharging(agvNumber, true);
+    return;
+  }
+
+  if (incoming == "NOT_CHARGING")
+  {
+    updateAGVCharging(agvNumber, false);
+    return;
+  }
+
+  // ==========================================
+  // ORIGINAL SYSTEM (UNCHANGED)
+  // ==========================================
+  String fullMessage = "AGV" + String(agvNumber) + ":" + incoming;
+
+  Serial.print("ESP-NOW RX -> ");
+  Serial.println(fullMessage);
+
+  // =====================================================
+  // PROCESS MESSAGE IMMEDIATELY
+  // =====================================================
+
+  if (operatingMode == 1)
+  {
+      processIncomingMessageStation(fullMessage);
+  }
+  else if (operatingMode == 2)
+  {
+      processIncomingMessageContinuous(fullMessage);
+  }
+  else if (operatingMode == 3)
+  {
+      processIncomingMessageCommand(fullMessage);
+  }
+}
+
+// =====================================================
+// READ SERIAL TEST INPUT
+// =====================================================
+
+// =====================================================
+// LEGACY PROCESS PENDING MESSAGE
+// =====================================================
+
+// =====================================================
+// NEXTION READER
+// =====================================================
+void readNextion()
+{ 
+  while (Serial2.available())
+  {
+    uint8_t b = Serial2.read();
+    if (b == 0xFF)
+    {
+      ffCount++;
+
+      if (ffCount == 3)
+      {
+        nextionBuffer.trim();
+        nextionBuffer.toUpperCase();
+
+        bool printable = true;
+        for (int k = 0; k < nextionBuffer.length(); k++)
+        {
+          char c = nextionBuffer[k];
+          if (c < 32 || c > 126)
+          {
+            printable = false;
+            break;
+          }
+        }
+
+        if (printable && nextionBuffer.length() > 0)
+        { 
+
+          if (nextionBuffer == "REFRESH_CHARGE")
+          {
+            Serial.println("Refreshing charging HMI...");
+            refreshChargingHMI();
+          }
+
+          if (nextionBuffer == "OP_STATION")
+          {
+            int oldMode = operatingMode;
+            operatingMode = 1;
+            handleOperatingModeChange(oldMode, operatingMode);
+            stationModeEnabled = true;
+            Serial.println("MODE = STATION");
+            startHMIRefreshWindow();
+          }
+          else if (nextionBuffer == "OP_CONTINUOUS")
+          { int oldMode = operatingMode;
+            operatingMode = 2;
+            handleOperatingModeChange(oldMode, operatingMode);
+            stationModeEnabled = false;
+            continuousLineStopped = false;
+            Serial.println("MODE = CONTINUOUS");
+            startHMIRefreshWindow();
+          }
+          else if (nextionBuffer == "OP_COMMAND")
+          { int oldMode = operatingMode;
+            operatingMode = 3;
+            handleOperatingModeChange(oldMode, operatingMode);
+            stationModeEnabled = false;
+            Serial.println("MODE = COMMAND");
+            startHMIRefreshWindow();
+          }
+          else if (nextionBuffer == "MOVE_OP3")
+          {
+            Serial.print("MOVE_OP3 received, operatingMode = ");
+            Serial.println(operatingMode);
+
+            if (operatingMode == 3)
+            {
+              if (isStation7Active())
+              {
+                Serial.println("OP3 MOVE ignored: AGV at Station 7");
+              }
+              else
+              {
+                moveAllAGVsOp3();
+              }
+            }
+          }
+          else if (nextionBuffer == "STOP_OP3")
+          {
+            Serial.print("STOP_OP3 received, operatingMode = ");
+            Serial.println(operatingMode);
+
+            if (operatingMode == 3)
+            {
+              if (isStation7Active())
+              {
+                Serial.println("OP3 STOP ignored: AGV at Station 7");
+              }
+              else
+              {
+                stopAllAGVsOp3();
+              }
+            }
+          }
+          else if (nextionBuffer == "SPEED1")  { continuousSpeed = 1;  Serial.println("Continuous speed = 1"); }
+          else if (nextionBuffer == "SPEED2")  { continuousSpeed = 2;  Serial.println("Continuous speed = 2"); }
+          else if (nextionBuffer == "SPEED3")  { continuousSpeed = 3;  Serial.println("Continuous speed = 3"); }
+          else if (nextionBuffer == "SPEED4")  { continuousSpeed = 4;  Serial.println("Continuous speed = 4"); }
+          else if (nextionBuffer == "SPEED5")  { continuousSpeed = 5;  Serial.println("Continuous speed = 5"); }
+          else if (nextionBuffer == "SPEED6")  { continuousSpeed = 6;  Serial.println("Continuous speed = 6"); }
+          else if (nextionBuffer == "SPEED7")  { continuousSpeed = 7;  Serial.println("Continuous speed = 7"); }
+          else if (nextionBuffer == "SPEED8")  { continuousSpeed = 8;  Serial.println("Continuous speed = 8"); }
+          else if (nextionBuffer == "SPEED9")  { continuousSpeed = 9;  Serial.println("Continuous speed = 9"); }
+          else if (nextionBuffer == "SPEED10") { continuousSpeed = 10; Serial.println("Continuous speed = 10"); }
+          else if (nextionBuffer == "SPEED11") { continuousSpeed = 11; Serial.println("Continuous speed = 11"); }
+          else if (nextionBuffer == "SPEED12") { continuousSpeed = 12; Serial.println("Continuous speed = 12"); }
+          else if (nextionBuffer == "SPEED13") { continuousSpeed = 13; Serial.println("Continuous speed = 13"); }
+          else if (nextionBuffer == "SPEED14") { continuousSpeed = 14; Serial.println("Continuous speed = 14"); }
+          else if (nextionBuffer == "SPEED15") { continuousSpeed = 15; Serial.println("Continuous speed = 15"); }
+      
+          else if (nextionBuffer == "STOP_LINE")
+          {
+            Serial.print("STOP_LINE received, operatingMode = ");
+            Serial.println(operatingMode);
+
+            if (operatingMode == 2)
+            {
+              if (isStation7Active())
+              {
+                Serial.println("OP2 STOP ignored: AGV at Station 7");
+              }
+              else
+              {
+                stopContinuousLineManual();
+              }
+            }
+          }
+          else if (nextionBuffer == "START_LINE")
+          {
+            Serial.print("START_LINE received, operatingMode = ");
+            Serial.println(operatingMode);
+
+            if (operatingMode == 2)
+            {
+              if (isStation7Active())
+              {
+                Serial.println("OP2 START ignored: AGV at Station 7");
+              }
+              else
+              {
+                continueContinuousLineManual();
+              }
+            }
+          }
+          else
+          {
+            Serial.print("Ignored Nextion packet: ");
+            Serial.println(nextionBuffer);
+          }
+        }
+
+        nextionBuffer = "";
+        ffCount = 0;
+      }
+    }
+    else
+    {
+      if (nextionBuffer.length() == 0 && (b < 32 || b > 126))
+      {
+        continue;
+      }
+
+      ffCount = 0;
+      nextionBuffer += (char)b;
+    }
+  }
+}
+
+// =====================================================
+// ADD ALL AGVS AS PEERS
+// =====================================================
+void addAllPeers()
+{
+  for (int i = 0; i < NUM_AGVS; i++)
+  {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, agvs[i].mac, 6);
+    peerInfo.channel = 13;
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) == ESP_OK)
+    {
+      Serial.print("Peer added: ");
+      Serial.println(agvs[i].name);
+    }
+    else
+    {
+      Serial.print("Failed to add peer: ");
+      Serial.println(agvs[i].name);
+    }
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup()
+{
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, NEXTION_RX, NEXTION_TX);
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+  addAllPeers();
+
+  Serial.println("Master ready");
+
+  sendNextionCommand("page page1");
+  delay(400);
+
+  clearSystemMemory();
+  refreshHMIFromMemory();
+
+  operatingMode = 1;
+  stationModeEnabled = true;
+  Serial.println("MODE = STATION (forced in setup for testing)");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop()
+{
+  readNextion();
+
+  if (hmiRefreshActive)
+  {
+    if (millis() - lastHMIRefresh >= 80)
+    {
+      lastHMIRefresh = millis();
+      refreshHMIFromMemory();
+    }
+
+    if (millis() - hmiRefreshStartTime >= 500)
+    {
+      hmiRefreshActive = false;
+    }
+  }
+}
+
+// "AT_STATION_1"
+// "AT_STATION_2"
+// "AT_STATION_3"
+// "AT_STATION_4"
+// "AT_STATION_5"
+// "AT_STATION_6"
+// "AT_STATION_7"
+// "AT_BUFFER"
+
+// "REQUEST_STATION_1"
+// "REQUEST_STATION_2"
+// "REQUEST_STATION_3"
+// "REQUEST_STATION_4"
+// "REQUEST_STATION_5"
+// "REQUEST_STATION_6"
+// "REQUEST_STATION_7"
+// "REQUEST_BUFFER"
+
+  // AT_PREBUFFER_1
+  // AT_PREBUFFER_2
+  // AT_PREBUFFER_3
+  // AT_PREBUFFER_4
+  // AT_PREBUFFER_5
+
+
+  // REQUEST_STATION_1
+  // REQUEST_PREBUFFER_2
+  // REQUEST_PREBUFFER_3
+  // REQUEST_PREBUFFER_4
+  // REQUEST_PREBUFFER_5
+
+  // CHARGING
+  // NOT_CHARGING
