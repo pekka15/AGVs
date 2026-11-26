@@ -17,25 +17,50 @@ message msg;
 // =====================================================
 int operatingMode = 0;
 bool hmiRefreshActive = false;
+volatile bool locationDisplayDirty = false;
 unsigned long hmiRefreshStartTime = 0;
 unsigned long lastHMIRefresh = 0;
 
 
 
-bool agvChargingState[13] = {false};
+bool agvChargingState[11] = {false};
 
 ///buffernothing 
-bool preBuffer1Occupied = false;
-bool preBuffer2Occupied = false;
-bool preBuffer3Occupied = false;
-bool preBuffer4Occupied = false;
-bool preBuffer5Occupied = false;
 
-String preBuffer1AGV = "";
-String preBuffer2AGV = "";
-String preBuffer3AGV = "";
-String preBuffer4AGV = "";
-String preBuffer5AGV = "";
+ // =====================================================
+ // LOADING STATIONS
+ // =====================================================
+ bool loadingBufferOccupied = false;
+ bool loadingStationOccupied = false;
+
+ String loadingBufferAGV = "";
+ String loadingStationAGV = "";
+
+ // Station 8 transit reservation: held until matching AGV reports arrival.
+ bool loadingBufferReserved = false;
+ String loadingBufferReservedAGV = "";
+
+ // =====================================================
+ // PREBUFFERS 1 TO 8
+ // =====================================================
+ bool preBuffer1Occupied = false;
+ bool preBuffer2Occupied = false;
+ bool preBuffer3Occupied = false;
+ bool preBuffer4Occupied = false;
+ bool preBuffer5Occupied = false;
+ bool preBuffer6Occupied = false;
+ bool preBuffer7Occupied = false;
+ bool preBuffer8Occupied = false;
+
+ String preBuffer1AGV = "";
+ String preBuffer2AGV = "";
+ String preBuffer3AGV = "";
+ String preBuffer4AGV = "";
+ String preBuffer5AGV = "";
+ String preBuffer6AGV = "";
+ String preBuffer7AGV = "";
+ String preBuffer8AGV = "";
+
 // =====================================================
 // AGV MAC TABLE
 // =====================================================
@@ -49,8 +74,6 @@ uint8_t agv7MAC[]  = {0x00, 0x10, 0x00, 0x00, 0x00, 0x03};
 uint8_t agv8MAC[]  = {0x20, 0x10, 0x00, 0x00, 0x00, 0x04};
 uint8_t agv9MAC[]  = {0x00, 0x00, 0x20, 0x00, 0x00, 0x05};
 uint8_t agv10MAC[] = {0x00, 0x00, 0x00, 0x20, 0x00, 0x02};
-uint8_t agv11MAC[] = {0x00, 0x00, 0x00, 0x00, 0x20, 0x03};
-uint8_t agv12MAC[] = {0x00, 0x00, 0x20, 0x00, 0x00, 0x04};
 
 struct AGVPeer
 {
@@ -69,9 +92,7 @@ AGVPeer agvs[] =
   {"AGV7",  agv7MAC},
   {"AGV8",  agv8MAC},
   {"AGV9",  agv9MAC},
-  {"AGV10", agv10MAC},
-  {"AGV11", agv11MAC},
-  {"AGV12", agv12MAC}
+  {"AGV10", agv10MAC}
 };
 
 const int NUM_AGVS = sizeof(agvs) / sizeof(agvs[0]);
@@ -105,8 +126,8 @@ String station6AGV = "";
 String station7AGV = "";
 String bufferAGV   = "";
 //global tracking in op2 
-String agvZone[13] = {
-  "", "", "", "", "", "", "", "", "", "", "", "", ""
+String agvZone[11] = {
+  "", "", "", "", "", "", "", "", "", "", ""
 };
 // =====================================================
 // MODE
@@ -190,6 +211,31 @@ void advancePreBufferChain()
     sendToAGVByName(agv, "CONTINUE_15");
     Serial.println("PB5 → PB4");
   }
+
+  if (!preBuffer5Occupied && preBuffer6Occupied)
+  {
+    String agv = preBuffer6AGV;
+    clearPreBufferStorage("6");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB6 -> PB5");
+  }
+
+  if (!preBuffer6Occupied && preBuffer7Occupied)
+  {
+    String agv = preBuffer7AGV;
+    clearPreBufferStorage("7");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB7 -> PB6");
+  }
+
+  if (!preBuffer7Occupied && preBuffer8Occupied)
+  {
+    String agv = preBuffer8AGV;
+    clearPreBufferStorage("8");
+    sendToAGVByName(agv, "CONTINUE_15");
+    Serial.println("PB8 -> PB7");
+  }
+
 }
 
 bool isStation7Active()
@@ -201,7 +247,7 @@ bool isStation7Active()
 // =====================================================
 void updateAGVCharging(int agvNumber, bool charging)
 {
-  if (agvNumber < 1 || agvNumber > 12) return;
+  if (agvNumber < 1 || agvNumber > 10) return;
 
   // 🔥 STORE STATE
   agvChargingState[agvNumber] = charging;
@@ -235,7 +281,7 @@ void updateAGVCharging(int agvNumber, bool charging)
 
 void refreshChargingHMI()
 {
-  for (int i = 1; i <= 12; i++)
+  for (int i = 1; i <= 10; i++)
   {
     updateAGVCharging(i, agvChargingState[i]);
     delay(20); // prevent Nextion overload
@@ -284,7 +330,7 @@ void handleOperatingModeChange(int oldMode, int newMode)
 
     Serial.println("Requesting AGV locations...");
 
-    for (int i = 1; i <= 12; i++)
+    for (int i = 1; i <= 10; i++)
     {
         String agvName = "AGV" + String(i);
         sendToAGVByName(agvName, "REPORT_LOCATION");
@@ -313,7 +359,7 @@ void handleOperatingModeChange(int oldMode, int newMode)
   {
     Serial.println("Switching to OP2 -> apply continuous speed");
 
-    for (int i = 1; i <= 12; i++)
+    for (int i = 1; i <= 10; i++)
     {
       if (agvZone[i] == "ON_LINE")
       {
@@ -331,7 +377,7 @@ void handleOperatingModeChange(int oldMode, int newMode)
   {
     Serial.println("Switching to OP3 -> freeze system");
 
-    for (int i = 1; i <= 12; i++)
+    for (int i = 1; i <= 10; i++)
     {
       if (agvZone[i] == "ON_LINE")
       {
@@ -345,6 +391,7 @@ void handleOperatingModeChange(int oldMode, int newMode)
 // =====================================================
 // PRE-BUFFER HELPERS
 // =====================================================
+
 void setPreBufferOccupied(const String &slot, bool occupied)
 {
   if (slot == "1")
@@ -372,11 +419,28 @@ void setPreBufferOccupied(const String &slot, bool occupied)
     preBuffer5Occupied = occupied;
     updateHMIStation("tsPreBuffer5", occupied);
   }
+  else if (slot == "6")
+  {
+    preBuffer6Occupied = occupied;
+    updateHMIStation("tsPreBuffer6", occupied);
+  }
+  else if (slot == "7")
+  {
+    preBuffer7Occupied = occupied;
+    updateHMIStation("tsPreBuffer7", occupied);
+  }
+  else if (slot == "8")
+  {
+    preBuffer8Occupied = occupied;
+    updateHMIStation("tsPreBuffer8", occupied);
+  }
 
   Serial.print("PreBuffer ");
   Serial.print(slot);
   Serial.println(occupied ? " occupied" : " available");
 }
+
+
 
 void clearPreBufferStorage(const String &slot)
 {
@@ -387,7 +451,12 @@ void clearPreBufferStorage(const String &slot)
   else if (slot == "3") preBuffer3AGV = "";
   else if (slot == "4") preBuffer4AGV = "";
   else if (slot == "5") preBuffer5AGV = "";
+  else if (slot == "6") preBuffer6AGV = "";
+  else if (slot == "7") preBuffer7AGV = "";
+  else if (slot == "8") preBuffer8AGV = "";
 }
+
+
 
 void handlePreBufferArrival(const String &agvName, const String &slot)
 {
@@ -398,24 +467,196 @@ void handlePreBufferArrival(const String &agvName, const String &slot)
   else if (slot == "3") preBuffer3AGV = agvName;
   else if (slot == "4") preBuffer4AGV = agvName;
   else if (slot == "5") preBuffer5AGV = agvName;
+  else if (slot == "6") preBuffer6AGV = agvName;
+  else if (slot == "7") preBuffer7AGV = agvName;
+  else if (slot == "8") preBuffer8AGV = agvName;
 
   Serial.print(agvName);
   Serial.print(" stored at PREBUFFER ");
   Serial.println(slot);
 }
 
+// Shared Station 7 -> Loading Buffer gate for all operating modes.
+// Reservation remains held if an outgoing movement command fails delivery.
+bool canReleaseStation7ToLoadingBuffer(const String &agvName)
+{
+  if (station7AGV != agvName)
+  {
+    Serial.println("Station 7 request ignored: AGV does not own Station 7");
+    return false;
+  }
+
+  if (loadingBufferOccupied || loadingBufferReserved)
+  {
+    Serial.println("Station 8 occupied/reserved; holding AGV at Station 7");
+    return false;
+  }
+
+  return true;
+}
+
+void reserveLoadingBufferFor(const String &agvName)
+{
+  loadingBufferReserved = true;
+  loadingBufferReservedAGV = agvName;
+  Serial.print("Station 8 reserved for ");
+  Serial.println(agvName);
+}
+
+void handleLoadingArrival(const String &agvName, const String &location)
+{
+  if (location == "BUFFER")
+  {
+    if (loadingBufferReserved && loadingBufferReservedAGV != agvName)
+    {
+      Serial.println("WARNING: Station 8 arrival conflicts with existing reservation");
+    }
+    if (loadingBufferReservedAGV == agvName)
+    {
+      loadingBufferReserved = false;
+      loadingBufferReservedAGV = "";
+    }
+    loadingBufferOccupied = true;
+    loadingBufferAGV = agvName;
+
+    Serial.print(agvName);
+    Serial.println(" arrived at LOADING BUFFER (Station 8)");
+  }
+  else if (location == "STATION")
+  {
+    loadingStationOccupied = true;
+    loadingStationAGV = agvName;
+
+    Serial.print(agvName);
+    Serial.println(" arrived at LOADING STATION (Station 9)");
+  }
+}
+
+
+void handleLoadingBufferMoveRequest(const String &agvName)
+{
+  if (loadingBufferAGV != agvName)
+  {
+    sendToAGVByName(agvName, "WAIT");
+    return;
+  }
+
+  if (!loadingStationOccupied)
+  {
+    loadingBufferOccupied = false;
+    loadingBufferAGV = "";
+
+    sendToAGVByName(agvName, "CONTINUE_15");
+
+    Serial.println("LOADING BUFFER -> LOADING STATION allowed");
+  }
+  else
+  {
+    sendToAGVByName(agvName, "WAIT");
+
+    Serial.println("LOADING STATION occupied, wait at LOADING BUFFER");
+  }
+}
+
+
+
+void handleLoadingStationMoveRequest(const String &agvName)
+{
+  if (loadingStationAGV != agvName)
+  {
+    sendToAGVByName(agvName, "WAIT");
+    return;
+  }
+
+  if (!preBuffer8Occupied)
+  {
+    loadingStationOccupied = false;
+    loadingStationAGV = "";
+
+    sendToAGVByName(agvName, "CONTINUE_15");
+
+    Serial.println("LOADING STATION -> PREBUFFER 8 allowed");
+  }
+}
+
+
 bool isPreBufferOpen(const String &slot)
 {
   if (slot == "1") return !preBuffer1Occupied;
-  if (slot == "2") return !preBuffer2Occupied;
-  if (slot == "3") return !preBuffer3Occupied;
-  if (slot == "4") return !preBuffer4Occupied;
-  if (slot == "5") return !preBuffer5Occupied;
+  else if (slot == "2") return !preBuffer2Occupied;
+  else if (slot == "3") return !preBuffer3Occupied;
+  else if (slot == "4") return !preBuffer4Occupied;
+  else if (slot == "5") return !preBuffer5Occupied;
+  else if (slot == "6") return !preBuffer6Occupied;
+  else if (slot == "7") return !preBuffer7Occupied;
+  else if (slot == "8") return !preBuffer8Occupied;
+
   return false;
 }
 
+
 void handlePreBufferMoveRequest(const String &agvName, const String &currentSlot)
-{
+{ 
+  if (currentSlot == "8")
+  {
+    if (preBuffer8AGV == agvName)
+    {
+      if (!preBuffer7Occupied)
+      {
+        clearPreBufferStorage("8");
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 8 -> 7 allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("PREBUFFER 7 occupied, wait at PREBUFFER 8");
+      }
+    }
+    return;
+  }
+
+  if (currentSlot == "7")
+  {
+    if (preBuffer7AGV == agvName)
+    {
+      if (!preBuffer6Occupied)
+      {
+        clearPreBufferStorage("7");
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 7 -> 6 allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("PREBUFFER 6 occupied, wait at PREBUFFER 7");
+      }
+    }
+    return;
+  }
+
+  if (currentSlot == "6")
+  {
+    if (preBuffer6AGV == agvName)
+    {
+      if (!preBuffer5Occupied)
+      {
+        clearPreBufferStorage("6");
+        sendToAGVByName(agvName, "CONTINUE_15");
+        advancePreBufferChain();
+        Serial.println("PREBUFFER 6 -> 5 allowed");
+      }
+      else
+      {
+        sendToAGVByName(agvName, "WAIT");
+        Serial.println("PREBUFFER 5 occupied, wait at PREBUFFER 6");
+      }
+    }
+    return;
+  }
+
   if (currentSlot == "5")
   {
     if (preBuffer5AGV == agvName)
@@ -534,7 +775,7 @@ void setAGVZone(const String &agvName, const String &zone)
   Serial.println(" = ON_LINE");
   int idx = getAGVIndexFromName(agvName);
 
-  if (idx >= 1 && idx <= 12)
+  if (idx >= 1 && idx <= 10)
   {
     agvZone[idx] = zone;
 
@@ -549,7 +790,7 @@ bool isAGVOnLine(const String &agvName)
 {
   int idx = getAGVIndexFromName(agvName);
 
-  if (idx >= 1 && idx <= 12)
+  if (idx >= 1 && idx <= 10)
   {
     return agvZone[idx] == "ON_LINE";
   }
@@ -564,7 +805,7 @@ void stopContinuousLine()
 
   continuousLineStopped = true;
 
-  for (int i = 1; i <= 12; i++)
+  for (int i = 1; i <= 10; i++)
   {
     if (agvZone[i] == "ON_LINE")
     {
@@ -584,7 +825,7 @@ void stopContinuousLineManual()
 
   continuousLineStopped = true;
 
-  for (int i = 1; i <= 12; i++)
+  for (int i = 1; i <= 10; i++)
   {
     if (agvZone[i] == "ON_LINE")
     {
@@ -604,7 +845,7 @@ void continueContinuousLineManual()
 
   continuousLineStopped = false;
 
-  for (int i = 1; i <= 12; i++)
+  for (int i = 1; i <= 10; i++)
   {
     if (agvZone[i] == "ON_LINE")
     {
@@ -665,7 +906,7 @@ void clearStationStorage(const String &station)
   {
     bufferOccupied = false;
     bufferAGV = "";
-    updateHMIStation("tsstatus8", bufferOccupied);
+    updateHMIStation("tsstatus18", bufferOccupied);
   }
 }
 /////////operating mode 2 code
@@ -740,19 +981,35 @@ void processIncomingMessageContinuous(String fullMessage)
 // MAP STATION 8-13 TO PREBUFFER SYSTEM
 // =====================================================
 
-  if      (command == "AT_STATION_8")  command = "AT_PREBUFFER_5";
-  else if (command == "AT_STATION_9")  command = "AT_PREBUFFER_4";
-  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_3";
-  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_2";
-  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_1";
-  else if (command == "AT_STATION_13") command = "AT_BUFFER";
 
-  else if (command == "REQUEST_STATION_8")  command = "REQUEST_PREBUFFER_5";
-  else if (command == "REQUEST_STATION_9")  command = "REQUEST_PREBUFFER_4";
-  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_3";
-  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_2";
-  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_1";
-  else if (command == "REQUEST_STATION_13") command = "REQUEST_BUFFER";
+  // =====================================================
+  // MAP ALL 18 PHYSICAL LOCATIONS
+  // =====================================================
+
+  if      (command == "AT_STATION_8")  command = "AT_LOADING_BUFFER";
+  else if (command == "AT_STATION_9")  command = "AT_LOADING_STATION";
+  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_8";
+  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_7";
+  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_6";
+  else if (command == "AT_STATION_13") command = "AT_PREBUFFER_5";
+  else if (command == "AT_STATION_14") command = "AT_PREBUFFER_4";
+  else if (command == "AT_STATION_15") command = "AT_PREBUFFER_3";
+  else if (command == "AT_STATION_16") command = "AT_PREBUFFER_2";
+  else if (command == "AT_STATION_17") command = "AT_PREBUFFER_1";
+  else if (command == "AT_STATION_18") command = "AT_BUFFER";
+
+  else if (command == "REQUEST_STATION_8")  command = "REQUEST_LOADING_BUFFER";
+  else if (command == "REQUEST_STATION_9")  command = "REQUEST_LOADING_STATION";
+  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_8";
+  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_7";
+  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_6";
+  else if (command == "REQUEST_STATION_13") command = "REQUEST_PREBUFFER_5";
+  else if (command == "REQUEST_STATION_14") command = "REQUEST_PREBUFFER_4";
+  else if (command == "REQUEST_STATION_15") command = "REQUEST_PREBUFFER_3";
+  else if (command == "REQUEST_STATION_16") command = "REQUEST_PREBUFFER_2";
+  else if (command == "REQUEST_STATION_17") command = "REQUEST_PREBUFFER_1";
+  else if (command == "REQUEST_STATION_18") command = "REQUEST_BUFFER";
+
 
 
   Serial.print("PROCESS OP2 -> ");
@@ -763,7 +1020,21 @@ void processIncomingMessageContinuous(String fullMessage)
 // =====================================================
 // PREBUFFER REQUESTS
 // =====================================================
-
+  if (command == "REQUEST_PREBUFFER_8")
+  {
+    handlePreBufferMoveRequest(agvName, "8");
+    return;
+  }
+  else if (command == "REQUEST_PREBUFFER_7")
+  {
+    handlePreBufferMoveRequest(agvName, "7");
+    return;
+  }
+  else if (command == "REQUEST_PREBUFFER_6")
+  {
+    handlePreBufferMoveRequest(agvName, "6");
+    return;
+  }
   if (command == "REQUEST_PREBUFFER_5")
   {
       handlePreBufferMoveRequest(agvName, "5");
@@ -908,6 +1179,8 @@ void processIncomingMessageContinuous(String fullMessage)
   {
       if (station7AGV == agvName)
       {
+          if (!canReleaseStation7ToLoadingBuffer(agvName)) return;
+          reserveLoadingBufferFor(agvName);
           clearStationStorage("7");
 
           // Release AGV at station 7 out of the line
@@ -918,7 +1191,7 @@ void processIncomingMessageContinuous(String fullMessage)
           continuousLineStopped = false;
 
           // Resume all AGVs already on the line
-          for (int i = 1; i <= 12; i++)
+          for (int i = 1; i <= 10; i++)
           {
               String otherAgv = "AGV" + String(i);
 
@@ -943,6 +1216,25 @@ void processIncomingMessageContinuous(String fullMessage)
     updateAGVCharging(agvNum, false);
     return;
   }
+  else if (command == "REQUEST_LOADING_BUFFER")
+  {
+    handleLoadingBufferMoveRequest(agvName);
+  }
+  else if (command == "REQUEST_LOADING_STATION")
+  {
+    handleLoadingStationMoveRequest(agvName);
+  }
+  else if (command == "AT_LOADING_BUFFER")
+  {
+      handleLoadingArrival(agvName, "BUFFER");
+  }
+  else if (command == "AT_LOADING_STATION")
+  {
+    handleLoadingArrival(agvName, "STATION");
+  }
+  else if (command == "AT_PREBUFFER_8") handlePreBufferArrival(agvName, "8");
+  else if (command == "AT_PREBUFFER_7") handlePreBufferArrival(agvName, "7");
+  else if (command == "AT_PREBUFFER_6") handlePreBufferArrival(agvName, "6");
   else if (command == "AT_PREBUFFER_5") handlePreBufferArrival(agvName, "5");
   else if (command == "AT_PREBUFFER_4") handlePreBufferArrival(agvName, "4");
   else if (command == "AT_PREBUFFER_3") handlePreBufferArrival(agvName, "3");
@@ -985,6 +1277,8 @@ void updateHMIStation(const String &stationName, bool occupied)
 
 void clearSystemMemory()
 {
+  loadingBufferReserved = false;
+  loadingBufferReservedAGV = "";
   station1Occupied = false;
   station2Occupied = false;
   station3Occupied = false;
@@ -1014,7 +1308,7 @@ void clearSystemMemory()
   preBuffer3AGV = "";
   preBuffer4AGV = "";
   preBuffer5AGV = "";
-    for (int i = 1; i <= 12; i++)
+    for (int i = 1; i <= 10; i++)
   {
     agvZone[i] = "";
   }
@@ -1022,14 +1316,31 @@ void clearSystemMemory()
 
 void refreshHMIFromMemory()
 {
-  updateHMIStation("tsstatus1", station1Occupied); delay(20);
-  updateHMIStation("tsstatus2", station2Occupied); delay(20);
-  updateHMIStation("tsstatus3", station3Occupied); delay(20);
-  updateHMIStation("tsstatus4", station4Occupied); delay(20);
-  updateHMIStation("tsstatus5", station5Occupied); delay(20);
-  updateHMIStation("tsstatus6", station6Occupied); delay(20);
-  updateHMIStation("tsstatus7", station7Occupied); delay(20);
-  updateHMIStation("tsstatus8", bufferOccupied);   delay(20);
+  const bool occupied[18] = {
+    station1Occupied, station2Occupied, station3Occupied,
+    station4Occupied, station5Occupied, station6Occupied,
+    station7Occupied, loadingBufferOccupied, loadingStationOccupied,
+    preBuffer8Occupied, preBuffer7Occupied, preBuffer6Occupied,
+    preBuffer5Occupied, preBuffer4Occupied, preBuffer3Occupied,
+    preBuffer2Occupied, preBuffer1Occupied, bufferOccupied
+  };
+
+  const String names[18] = {
+    station1AGV, station2AGV, station3AGV,
+    station4AGV, station5AGV, station6AGV,
+    station7AGV, loadingBufferAGV, loadingStationAGV,
+    preBuffer8AGV, preBuffer7AGV, preBuffer6AGV,
+    preBuffer5AGV, preBuffer4AGV, preBuffer3AGV,
+    preBuffer2AGV, preBuffer1AGV, bufferAGV
+  };
+
+  for (int i = 0; i < 18; ++i)
+  {
+    String number = String(i + 1);
+    updateHMIStation("tsstatus" + number, occupied[i]);
+    sendNextionCommand("tsagv" + number + ".txt=\"" + names[i] + "\"");
+    delay(10);
+  }
 }
 
 void startHMIRefreshWindow()
@@ -1054,23 +1365,165 @@ int getAGVNumberFromMAC(const uint8_t *mac)
   return -1;
 }
 
-void sendToAGVByName(const String &agvName, const char *cmd)
+// =====================================================
+// ESP-NOW DELIVERY RETRY QUEUE
+// Maximum five attempts per outgoing message; then move on.
+// Existing station/Nextion logic is unchanged.
+// =====================================================
+constexpr uint8_t TX_QUEUE_SIZE = 64;
+constexpr unsigned long TX_RETRY_MS = 300;
+constexpr unsigned long TX_CALLBACK_TIMEOUT_MS = 1500;
+constexpr uint8_t TX_MAX_ATTEMPTS = 5;
+
+struct PendingTx
 {
-  memset(&msg, 0, sizeof(msg));
-  strncpy(msg.text, cmd, sizeof(msg.text) - 1);
+  uint8_t mac[6];
+  char command[32];
+  uint8_t agvIndex;
+};
 
-  for (int i = 0; i < NUM_AGVS; i++)
+PendingTx txQueue[TX_QUEUE_SIZE];
+uint8_t txHead = 0;
+uint8_t txTail = 0;
+uint8_t txCount = 0;
+bool txAwaitingCallback = false;
+unsigned long txNextAttemptAt = 0;
+unsigned long txAttemptStartedAt = 0;
+uint8_t txAttempts = 0;
+
+portMUX_TYPE txMux = portMUX_INITIALIZER_UNLOCKED;
+volatile int txCallbackResult = 0; // 0=pending, 1=success, -1=fail
+
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status)
+{
+  // Wi-Fi callback: record only; process on main loop.
+  portENTER_CRITICAL(&txMux);
+  txCallbackResult = (status == ESP_NOW_SEND_SUCCESS) ? 1 : -1;
+  portEXIT_CRITICAL(&txMux);
+}
+
+void finishCurrentTx(bool delivered)
+{
+  Serial.print(delivered ? "ESP-NOW DELIVERY SUCCESS -> "
+                         : "ESP-NOW DELIVERY FAILED (5 attempts) -> ");
+  Serial.print(agvs[txQueue[txHead].agvIndex].name);
+  Serial.print(": ");
+  Serial.println(txQueue[txHead].command);
+
+  txHead = (txHead + 1) % TX_QUEUE_SIZE;
+  txCount--;
+  txAttempts = 0;
+  txAwaitingCallback = false;
+  txNextAttemptAt = millis();
+}
+
+void serviceESPNowTxQueue()
+{
+  if (txCount == 0) return;
+
+  int result;
+  portENTER_CRITICAL(&txMux);
+  result = txCallbackResult;
+  txCallbackResult = 0;
+  portEXIT_CRITICAL(&txMux);
+
+  if (txAwaitingCallback)
   {
-    if (agvName.equalsIgnoreCase(agvs[i].name))
+    if (result == 1)
     {
-      esp_now_send(agvs[i].mac, (uint8_t *)&msg, sizeof(msg));
-
-      Serial.print("MASTER -> ");
-      Serial.print(agvName);
-      Serial.print(": ");
-      Serial.println(cmd);
+      finishCurrentTx(true);
       return;
     }
+
+    if (result == -1 ||
+        millis() - txAttemptStartedAt >= TX_CALLBACK_TIMEOUT_MS)
+    {
+      txAwaitingCallback = false;
+      if (result == 0)
+        Serial.println("ESP-NOW delivery callback timeout");
+
+      if (txAttempts >= TX_MAX_ATTEMPTS)
+      {
+        finishCurrentTx(false);
+        return;
+      }
+
+      Serial.print("ESP-NOW DELIVERY FAIL; retry ");
+      Serial.print(txAttempts + 1);
+      Serial.print("/5 -> ");
+      Serial.print(agvs[txQueue[txHead].agvIndex].name);
+      Serial.print(": ");
+      Serial.println(txQueue[txHead].command);
+      txNextAttemptAt = millis() + TX_RETRY_MS;
+    }
+    else
+    {
+      return;
+    }
+  }
+
+  if ((long)(millis() - txNextAttemptAt) < 0) return;
+  if (txAttempts >= TX_MAX_ATTEMPTS)
+  {
+    finishCurrentTx(false);
+    return;
+  }
+
+  message outgoing = {};
+  strncpy(outgoing.text, txQueue[txHead].command, sizeof(outgoing.text) - 1);
+
+  portENTER_CRITICAL(&txMux);
+  txCallbackResult = 0;
+  portEXIT_CRITICAL(&txMux);
+
+  esp_err_t err = esp_now_send(txQueue[txHead].mac,
+                               (const uint8_t *)&outgoing, sizeof(outgoing));
+  txAttempts++;
+  if (err == ESP_OK)
+  {
+    txAwaitingCallback = true;
+    txAttemptStartedAt = millis();
+  }
+  else
+  {
+    Serial.print("ESP-NOW send error ");
+    Serial.print((int)err);
+    Serial.print(" -> ");
+    Serial.print(agvs[txQueue[txHead].agvIndex].name);
+    Serial.print(": ");
+    Serial.println(txQueue[txHead].command);
+    if (txAttempts >= TX_MAX_ATTEMPTS)
+      finishCurrentTx(false);
+    else
+      txNextAttemptAt = millis() + TX_RETRY_MS;
+  }
+}
+
+void sendToAGVByName(const String &agvName, const char *cmd)
+{
+  for (int i = 0; i < NUM_AGVS; i++)
+  {
+    if (!agvName.equalsIgnoreCase(agvs[i].name)) continue;
+
+    if (txCount >= TX_QUEUE_SIZE)
+    {
+      Serial.println("CRITICAL: ESP-NOW TX queue full; command NOT queued!");
+      return;
+    }
+
+    PendingTx &entry = txQueue[txTail];
+    memcpy(entry.mac, agvs[i].mac, 6);
+    memset(entry.command, 0, sizeof(entry.command));
+    strncpy(entry.command, cmd, sizeof(entry.command) - 1);
+    entry.agvIndex = i;
+    txTail = (txTail + 1) % TX_QUEUE_SIZE;
+    txCount++;
+
+    Serial.print("MASTER QUEUED -> ");
+    Serial.print(agvName);
+    Serial.print(": ");
+    Serial.println(cmd);
+    return;
   }
 
   Serial.print("Unknown AGV name: ");
@@ -1127,7 +1580,7 @@ void setStationOccupied(const String &station)
   else if (station == "BUFFER")
   {
     bufferOccupied = true;
-    updateHMIStation("tsstatus8", bufferOccupied);
+    updateHMIStation("tsstatus18", bufferOccupied);
     Serial.println("Buffer occupied");
   }
 }
@@ -1293,6 +1746,8 @@ void handleMoveRequest(const String &agvName, const String &currentStation)
   }
   else if (currentStation == "7")
   {
+    if (!canReleaseStation7ToLoadingBuffer(agvName)) return;
+    reserveLoadingBufferFor(agvName);
     station7Occupied = false;
     updateHMIStation("tsstatus7", station7Occupied);
     sendToAGVByName(agvName, "CONTINUE_15");
@@ -1303,7 +1758,7 @@ void handleMoveRequest(const String &agvName, const String &currentStation)
     if (!station1Occupied)
     {
       bufferOccupied = false;
-      updateHMIStation("tsstatus8", bufferOccupied);
+      updateHMIStation("tsstatus18", bufferOccupied);
       sendToAGVByName(agvName, "CONTINUE_15");
       bufferAGV = "";
     }
@@ -1338,19 +1793,30 @@ void processIncomingMessageStation(String fullMessage)
 // MAP STATION 8-13 TO PREBUFFER SYSTEM
 // =====================================================
   
-  if      (command == "AT_STATION_8")  command = "AT_PREBUFFER_5";
-  else if (command == "AT_STATION_9")  command = "AT_PREBUFFER_4";
-  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_3";
-  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_2";
-  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_1";
-  else if (command == "AT_STATION_13") command = "AT_BUFFER";
+  if      (command == "AT_STATION_8")  command = "AT_LOADING_BUFFER";
+  else if (command == "AT_STATION_9")  command = "AT_LOADING_STATION";
+  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_8";
+  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_7";
+  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_6";
+  else if (command == "AT_STATION_13") command = "AT_PREBUFFER_5";
+  else if (command == "AT_STATION_14") command = "AT_PREBUFFER_4";
+  else if (command == "AT_STATION_15") command = "AT_PREBUFFER_3";
+  else if (command == "AT_STATION_16") command = "AT_PREBUFFER_2";
+  else if (command == "AT_STATION_17") command = "AT_PREBUFFER_1";
+  else if (command == "AT_STATION_18") command = "AT_BUFFER";
 
-  else if (command == "REQUEST_STATION_8")  command = "REQUEST_PREBUFFER_5";
-  else if (command == "REQUEST_STATION_9")  command = "REQUEST_PREBUFFER_4";
-  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_3";
-  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_2";
-  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_1";
-  else if (command == "REQUEST_STATION_13") command = "REQUEST_BUFFER";
+  else if (command == "REQUEST_STATION_8")  command = "REQUEST_LOADING_BUFFER";
+  else if (command == "REQUEST_STATION_9")  command = "REQUEST_LOADING_STATION";
+  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_8";
+  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_7";
+  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_6";
+  else if (command == "REQUEST_STATION_13") command = "REQUEST_PREBUFFER_5";
+  else if (command == "REQUEST_STATION_14") command = "REQUEST_PREBUFFER_4";
+  else if (command == "REQUEST_STATION_15") command = "REQUEST_PREBUFFER_3";
+  else if (command == "REQUEST_STATION_16") command = "REQUEST_PREBUFFER_2";
+  else if (command == "REQUEST_STATION_17") command = "REQUEST_PREBUFFER_1";
+  else if (command == "REQUEST_STATION_18") command = "REQUEST_BUFFER";
+
   Serial.print("PROCESS OP1 -> ");
   Serial.println(fullMessage);
   if (command == "CHARGING")
@@ -1382,36 +1848,61 @@ void processIncomingMessageStation(String fullMessage)
   else if (command == "REQUEST_STATION_6") handleMoveRequest(agvName, "6");
   else if (command == "REQUEST_STATION_7") handleMoveRequest(agvName, "7");
   else if (command == "REQUEST_BUFFER")    handleMoveRequest(agvName, "BUFFER");
- 
+  else if (command == "AT_LOADING_BUFFER")
+  {
+      handleLoadingArrival(agvName, "BUFFER");
+  }
+  else if (command == "AT_LOADING_STATION")
+  {
+    handleLoadingArrival(agvName, "STATION");
+  }
+  else if (command == "AT_PREBUFFER_8") handlePreBufferArrival(agvName, "8");
+  else if (command == "AT_PREBUFFER_7") handlePreBufferArrival(agvName, "7");
+  else if (command == "AT_PREBUFFER_6") handlePreBufferArrival(agvName, "6");
   else if (command == "AT_PREBUFFER_5") handlePreBufferArrival(agvName, "5");
   else if (command == "AT_PREBUFFER_4") handlePreBufferArrival(agvName, "4");
   else if (command == "AT_PREBUFFER_3") handlePreBufferArrival(agvName, "3");
   else if (command == "AT_PREBUFFER_2") handlePreBufferArrival(agvName, "2");
   else if (command == "AT_PREBUFFER_1") handlePreBufferArrival(agvName, "1");
-
+  else if (command == "REQUEST_LOADING_BUFFER")
+  {
+    handleLoadingBufferMoveRequest(agvName);
+  }
+  else if (command == "REQUEST_LOADING_STATION")
+  {
+    handleLoadingStationMoveRequest(agvName);
+  }
+  
+  else if (command == "REQUEST_PREBUFFER_8")
+  {
+    handlePreBufferMoveRequest(agvName, "8");
+  }
+  else if (command == "REQUEST_PREBUFFER_7")
+  {
+    handlePreBufferMoveRequest(agvName, "7");
+  }
+  else if (command == "REQUEST_PREBUFFER_6")
+  {
+    handlePreBufferMoveRequest(agvName, "6");
+  }
   else if (command == "REQUEST_PREBUFFER_5")
   {
-      handlePreBufferArrival(agvName, "5");
       handlePreBufferMoveRequest(agvName, "5");
   }
   else if (command == "REQUEST_PREBUFFER_4")
   {
-      handlePreBufferArrival(agvName, "4");
       handlePreBufferMoveRequest(agvName, "4");
   }
   else if (command == "REQUEST_PREBUFFER_3")
   {
-      handlePreBufferArrival(agvName, "3");
       handlePreBufferMoveRequest(agvName, "3");
   }
   else if (command == "REQUEST_PREBUFFER_2")
   {
-      handlePreBufferArrival(agvName, "2");
       handlePreBufferMoveRequest(agvName, "2");
   }
   else if (command == "REQUEST_PREBUFFER_1")
   {
-      handlePreBufferArrival(agvName, "1");
       handlePreBufferMoveRequest(agvName, "1");
   }
  
@@ -1453,19 +1944,35 @@ void processIncomingMessageCommand(String fullMessage)
 // MAP STATION 8-13 TO PREBUFFER SYSTEM
 // =====================================================
 
-  if      (command == "AT_STATION_8")  command = "AT_PREBUFFER_5";
-  else if (command == "AT_STATION_9")  command = "AT_PREBUFFER_4";
-  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_3";
-  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_2";
-  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_1";
-  else if (command == "AT_STATION_13") command = "AT_BUFFER";
 
-  else if (command == "REQUEST_STATION_8")  command = "REQUEST_PREBUFFER_5";
-  else if (command == "REQUEST_STATION_9")  command = "REQUEST_PREBUFFER_4";
-  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_3";
-  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_2";
-  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_1";
-  else if (command == "REQUEST_STATION_13") command = "REQUEST_BUFFER";
+  // =====================================================
+  // MAP ALL 18 PHYSICAL LOCATIONS
+  // =====================================================
+
+  if      (command == "AT_STATION_8")  command = "AT_LOADING_BUFFER";
+  else if (command == "AT_STATION_9")  command = "AT_LOADING_STATION";
+  else if (command == "AT_STATION_10") command = "AT_PREBUFFER_8";
+  else if (command == "AT_STATION_11") command = "AT_PREBUFFER_7";
+  else if (command == "AT_STATION_12") command = "AT_PREBUFFER_6";
+  else if (command == "AT_STATION_13") command = "AT_PREBUFFER_5";
+  else if (command == "AT_STATION_14") command = "AT_PREBUFFER_4";
+  else if (command == "AT_STATION_15") command = "AT_PREBUFFER_3";
+  else if (command == "AT_STATION_16") command = "AT_PREBUFFER_2";
+  else if (command == "AT_STATION_17") command = "AT_PREBUFFER_1";
+  else if (command == "AT_STATION_18") command = "AT_BUFFER";
+
+  else if (command == "REQUEST_STATION_8")  command = "REQUEST_LOADING_BUFFER";
+  else if (command == "REQUEST_STATION_9")  command = "REQUEST_LOADING_STATION";
+  else if (command == "REQUEST_STATION_10") command = "REQUEST_PREBUFFER_8";
+  else if (command == "REQUEST_STATION_11") command = "REQUEST_PREBUFFER_7";
+  else if (command == "REQUEST_STATION_12") command = "REQUEST_PREBUFFER_6";
+  else if (command == "REQUEST_STATION_13") command = "REQUEST_PREBUFFER_5";
+  else if (command == "REQUEST_STATION_14") command = "REQUEST_PREBUFFER_4";
+  else if (command == "REQUEST_STATION_15") command = "REQUEST_PREBUFFER_3";
+  else if (command == "REQUEST_STATION_16") command = "REQUEST_PREBUFFER_2";
+  else if (command == "REQUEST_STATION_17") command = "REQUEST_PREBUFFER_1";
+  else if (command == "REQUEST_STATION_18") command = "REQUEST_BUFFER";
+
   Serial.print("PROCESS OP3 -> ");
   Serial.println(fullMessage);
 
@@ -1492,12 +1999,45 @@ void processIncomingMessageCommand(String fullMessage)
   else if (command == "AT_STATION_6") handleArrivalMessage(agvName, "6");
   else if (command == "AT_STATION_7") handleArrivalMessage(agvName, "7");
   else if (command == "AT_BUFFER")    handleArrivalMessage(agvName, "BUFFER");
+  else if (command == "AT_LOADING_BUFFER")
+  {
+      handleLoadingArrival(agvName, "BUFFER");
+  }
+  else if (command == "AT_LOADING_STATION")
+  {
+    handleLoadingArrival(agvName, "STATION");
+  }
+  else if (command == "AT_PREBUFFER_8") handlePreBufferArrival(agvName, "8");
+  else if (command == "AT_PREBUFFER_7") handlePreBufferArrival(agvName, "7");
+  else if (command == "AT_PREBUFFER_6") handlePreBufferArrival(agvName, "6");
   else if (command == "AT_PREBUFFER_5") handlePreBufferArrival(agvName, "5");
   else if (command == "AT_PREBUFFER_4") handlePreBufferArrival(agvName, "4");
   else if (command == "AT_PREBUFFER_3") handlePreBufferArrival(agvName, "3");
   else if (command == "AT_PREBUFFER_2") handlePreBufferArrival(agvName, "2");
   else if (command == "AT_PREBUFFER_1") handlePreBufferArrival(agvName, "1");
-
+  else if (command == "REQUEST_LOADING_BUFFER")
+  {
+    handleLoadingBufferMoveRequest(agvName);
+  }
+  else if (command == "REQUEST_LOADING_STATION")
+  {
+    handleLoadingStationMoveRequest(agvName);
+  }
+  else if (command == "REQUEST_PREBUFFER_8")
+  {
+    handlePreBufferArrival(agvName, "8");
+    handlePreBufferMoveRequest(agvName, "8");
+  }
+  else if (command == "REQUEST_PREBUFFER_7")
+  {
+    handlePreBufferArrival(agvName, "7");
+    handlePreBufferMoveRequest(agvName, "7");
+  }
+  else if (command == "REQUEST_PREBUFFER_6")
+  {
+    handlePreBufferArrival(agvName, "6");
+    handlePreBufferMoveRequest(agvName, "6");
+  }
   else if (command == "REQUEST_PREBUFFER_5")
   {
       handlePreBufferArrival(agvName, "5");
@@ -1527,6 +2067,8 @@ void processIncomingMessageCommand(String fullMessage)
   {
     if (station7AGV == agvName)
     {
+      if (!canReleaseStation7ToLoadingBuffer(agvName)) return;
+      reserveLoadingBufferFor(agvName);
       Serial.println("OP3 -> RELEASE FROM STATION 7");
 
       clearStationStorage("7");
@@ -1587,7 +2129,7 @@ void moveAllAGVsOp3()
   Serial.println("OP 3 -> MOVE ALL AGVS BETWEEN 1 AND 7");
   Serial.println("=================================");
 
-  for (int i = 1; i <= 12; i++)
+  for (int i = 1; i <= 10; i++)
   {
     if (agvZone[i] == "ON_LINE")   // 🔥 ONLY ACTIVE AGVS
     {
@@ -1608,7 +2150,7 @@ void stopAllAGVsOp3()
   Serial.println("OP 3 -> STOP ALL AGVS");
   Serial.println("=================================");
 
-  for (int i = 1; i <= 12; i++)
+  for (int i = 1; i <= 10; i++)
   {
     if (agvZone[i] == "ON_LINE")   // 🔥 ONLY ACTIVE AGVS
     {
@@ -1698,6 +2240,7 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   {
       processIncomingMessageCommand(fullMessage);
   }
+  locationDisplayDirty = true;
 }
 
 // =====================================================
@@ -1922,6 +2465,7 @@ void setup()
   }
 
   esp_now_register_recv_cb(onDataRecv);
+  esp_now_register_send_cb(onDataSent);
   addAllPeers();
 
   Serial.println("Master ready");
@@ -1942,7 +2486,33 @@ void setup()
 // =====================================================
 void loop()
 {
+  serviceESPNowTxQueue();
   readNextion();
+
+  // Bench testing: type AGV1:AT_STATION_8 etc. in Serial Monitor.
+  if (Serial.available())
+  {
+    String testMessage = Serial.readStringUntil('\n');
+    testMessage.trim();
+    if (testMessage.length() > 0)
+    {
+      Serial.print("TEST RX -> ");
+      Serial.println(testMessage);
+      if (operatingMode == 1)
+        processIncomingMessageStation(testMessage);
+      else if (operatingMode == 2)
+        processIncomingMessageContinuous(testMessage);
+      else if (operatingMode == 3)
+        processIncomingMessageCommand(testMessage);
+      locationDisplayDirty = true;
+    }
+  }
+
+  if (locationDisplayDirty)
+  {
+    locationDisplayDirty = false;
+    refreshHMIFromMemory();
+  }
 
   if (hmiRefreshActive)
   {
@@ -1951,11 +2521,8 @@ void loop()
       lastHMIRefresh = millis();
       refreshHMIFromMemory();
     }
-
     if (millis() - hmiRefreshStartTime >= 500)
-    {
       hmiRefreshActive = false;
-    }
   }
 }
 
