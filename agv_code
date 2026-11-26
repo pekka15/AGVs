@@ -23,7 +23,17 @@ int ultrasonicDistance = 999;
 bool stationDetectionActive = false;
 
 bool ultrasonicStop = false;
+// Ultrasonic timing
+const unsigned long ULTRA_AVERAGE_MS = 3000;
+const unsigned long ULTRA_LOCKOUT_MS = 5000;
 
+unsigned long ultraWindowStart = 0;
+unsigned long ultraLockoutStart = 0;
+
+unsigned long ultraDistanceSum = 0;
+unsigned int ultraSampleCount = 0;
+
+bool ultraLockoutActive = false;
 // Optional filtering
 float ultrasonicFiltered = 999;
 const float ULTRA_ALPHA = 0.3f;
@@ -368,32 +378,58 @@ void updateUltrasonicScaling(int distance)
 {
   ultrasonicDistance = distance;
 
-  // Simple, direct logic
-  if (distance <= 200) {
+  // Immediate stop when obstacle is too close
+  if (distance <= 200)
+  {
     ultrasonicStop = true;
-  } else if (distance >= 230) {
-    ultrasonicStop = false;
+    ultraLockoutActive = false;
   }
 
-  Serial.print("DIST=");
-  Serial.print(distance);
-  Serial.print(" STOP=");
-  Serial.println(ultrasonicStop);
-}
-
-void handleWaitingRequests()
-{
-  if (!waitingForPermission) return;
-  if (waitingRequestMessage.length() == 0) return;
-
-  if (millis() - lastPermissionRequestTime >= REQUEST_REPEAT_MS)
+  // Collect readings over 3 seconds
+  if (ultraSampleCount == 0)
   {
-    lastPermissionRequestTime = millis();
+    ultraWindowStart = millis();
+  }
 
-    Serial.print("Retry request -> ");
-    Serial.println(waitingRequestMessage);
+  ultraDistanceSum += distance;
+  ultraSampleCount++;
 
-    sendToMaster(waitingRequestMessage.c_str());
+  if (millis() - ultraWindowStart >= ULTRA_AVERAGE_MS)
+  {
+    float average = (float)ultraDistanceSum / ultraSampleCount;
+    ultrasonicFiltered = average;
+
+    if (average <= 200)
+    {
+      ultrasonicStop = true;
+      ultraLockoutActive = false;
+    }
+
+    ultraDistanceSum = 0;
+    ultraSampleCount = 0;
+  }
+
+  // Require 5 continuous seconds of clear distance
+  if (ultrasonicStop)
+  {
+    if (distance >= 200)
+    {
+      if (!ultraLockoutActive)
+      {
+        ultraLockoutActive = true;
+        ultraLockoutStart = millis();
+      }
+
+      if (millis() - ultraLockoutStart >= ULTRA_LOCKOUT_MS)
+      {
+        ultrasonicStop = false;
+        ultraLockoutActive = false;
+      }
+    }
+    else
+    {
+      ultraLockoutActive = false;
+    }
   }
 }
 // =====================================================
@@ -705,29 +741,19 @@ String mapTagToArrivalMessage(const String &tag) {
   return "";
 }
 
-String mapArrivalToRequest(const String &arrivalMessage) {
-  if (arrivalMessage == "AT_STATION_1")    return "REQUEST_STATION_1";
-  if (arrivalMessage == "AT_STATION_2")    return "REQUEST_STATION_2";
-  if (arrivalMessage == "AT_STATION_3")    return "REQUEST_STATION_3";
-  if (arrivalMessage == "AT_STATION_4")    return "REQUEST_STATION_4";
-  if (arrivalMessage == "AT_STATION_5")    return "REQUEST_STATION_5";
-  if (arrivalMessage == "AT_STATION_6")    return "REQUEST_STATION_6";
-  if (arrivalMessage == "AT_STATION_7")    return "REQUEST_STATION_7";
-  if (arrivalMessage == "AT_STATION_8")  return "REQUEST_STATION_8";
-  if (arrivalMessage == "AT_STATION_9")  return "REQUEST_STATION_9";
-  if (arrivalMessage == "AT_STATION_10") return "REQUEST_STATION_10";
-  if (arrivalMessage == "AT_STATION_11") return "REQUEST_STATION_11";
-  if (arrivalMessage == "AT_STATION_12") return "REQUEST_STATION_12";
-  if (arrivalMessage == "AT_STATION_13")   return "REQUEST_BUFFER";
-
-  if (arrivalMessage == "AT_PREBUFFER_5")  return "REQUEST_PREBUFFER_5";
-  if (arrivalMessage == "AT_PREBUFFER_4")  return "REQUEST_PREBUFFER_4";
-  if (arrivalMessage == "AT_PREBUFFER_3")  return "REQUEST_PREBUFFER_3";
-  if (arrivalMessage == "AT_PREBUFFER_2")  return "REQUEST_PREBUFFER_2";
-  if (arrivalMessage == "AT_PREBUFFER_1")  return "REQUEST_PREBUFFER_1";
+String mapArrivalToRequest(const String &arrivalMessage)
+{
+  for (int station = 1; station <= 18; station++)
+  {
+    if (arrivalMessage == "AT_STATION_" + String(station))
+    {
+      return "REQUEST_STATION_" + String(station);
+    }
+  }
 
   return "";
 }
+
 
 void startWaitingAtLocation(const String &arrivalMessage)
 { 
@@ -776,23 +802,31 @@ void startWaitingAtLocation(const String &arrivalMessage)
 // -------------------------------------------------
 // PREBUFFER STATIONS AUTO-REQUEST
 // -------------------------------------------------
+// Station 8 moves automatically through the Master.
+// Stations 10-17 are automatic prebuffers.
+// Station 9 requires the operator button.
+
   if (arrivalMessage == "AT_STATION_8"  ||
-      arrivalMessage == "AT_STATION_9"  ||
       arrivalMessage == "AT_STATION_10" ||
       arrivalMessage == "AT_STATION_11" ||
-      arrivalMessage == "AT_STATION_12")
+      arrivalMessage == "AT_STATION_12" ||
+      arrivalMessage == "AT_STATION_13" ||
+      arrivalMessage == "AT_STATION_14" ||
+      arrivalMessage == "AT_STATION_15" ||
+      arrivalMessage == "AT_STATION_16" ||
+      arrivalMessage == "AT_STATION_17")
   {
       waitingForPermission = true;
       lastPermissionRequestTime = 0;
 
-      Serial.println("Prebuffer station -> automatic request enabled");
+      Serial.println("Prebuffer -> automatic request enabled");
   }
   else
   {
       waitingForPermission = false;
       lastPermissionRequestTime = 0;
 
-      Serial.println("Normal station -> waiting for button/manual request");
+      Serial.println("Waiting for Master or operator button");
   }
 }
 
@@ -831,7 +865,7 @@ void resetAutoStationState()
   waitingRequestMessage = "";
 
   // RESET SPEED BACK TO NORMAL
-  updateSpeedScaleFromStep(5);
+  updateSpeedScaleFromStep(15);
 
   Serial.println("AUTO STATE RESET");
 }
@@ -963,7 +997,18 @@ void updateUltrasonicRS485()
     }
   }
 }
+void handleWaitingRequests()
+{
+  if (!waitingForPermission) return;
+  if (waitingRequestMessage.length() == 0) return;
 
+  if (lastPermissionRequestTime == 0 ||
+      millis() - lastPermissionRequestTime >= REQUEST_REPEAT_MS)
+  {
+    lastPermissionRequestTime = millis();
+    sendToMaster(waitingRequestMessage.c_str());
+  }
+}
 
 
 
@@ -1205,12 +1250,9 @@ void loop() {
     ultrasonicStop = false;   // prevents ghost stops
 }
 
-    // 🔥 HARD STOP PRIORITY (ONLY ONE PLACE)
-    if (ultrasonicEnabled && ultrasonicStop) {
-      stopMotors();
-    }
-
-    else if (stoppedAtStation) {
+    // HARD STOP PRIORITY (ONLY ONE PLACE)
+    
+    if (stoppedAtStation) {
       stopMotors();
 
       if (buttonPressedEvent()) {
@@ -1218,6 +1260,10 @@ void loop() {
       }
 
       handleWaitingRequests();
+    }
+
+    else if (ultrasonicEnabled && ultrasonicStop) {
+      stopMotors();
     }
 
     else if (!autoMovementFlag) {
